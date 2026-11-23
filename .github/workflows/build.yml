@@ -21,12 +21,15 @@ jobs:
       - name: Build ondevice native packer
         working-directory: ./android
         run: |
+          find . -name "*.sh" -exec sed -i 's/\r$//' {} +
           chmod +x ondevice/build.sh
-          ./ondevice/build.sh work
+          bash ./ondevice/build.sh work
 
       - name: Make gradlew executable
         working-directory: ./android/app
-        run: chmod +x gradlew
+        run: |
+          sed -i 's/\r$//' gradlew
+          chmod +x gradlew
 
       - name: Build Banana Splint Native APK
         working-directory: ./android/app
