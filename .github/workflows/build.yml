@@ -1,42 +1,140 @@
-name: Banana Splint Native Build
+name: Build Banana Splint Native APK
 
 on:
   workflow_dispatch:
+    inputs:
+      games:
+        description: 'Title IDs for -PnxGames, comma separated ("all" = every game in gradle.properties: much slower)'
+        default: '0400486024DEC000'
+      label:
+        description: 'App name on the phone'
+        default: 'Banana Splint Native'
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md']
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      NDK_VERSION: 28.2.13676358          # android/app/build.gradle: ndkVersion
+      CMAKE_VERSION: 3.22.1               # android/app/build.gradle: externalNativeBuild cmake version
+      WORK: ${{ github.workspace }}/work  # android/ondevice/build.sh's work dir; its stage/ is what -PnxPackStage takes
+      GAMES: ${{ inputs.games || '0400486024DEC000' }}
+      APP_LABEL: ${{ inputs.label || 'Banana Splint Native' }}
+      # The translator is NativeAOT-compiled for bionic with the NDK's clang: its objcopy must be the NDK's too (a GNU objcopy of this x86-64 host cannot strip arm64 ELF files)
+      ObjCopyName: llvm-objcopy
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+
     steps:
-      - name: Checkout code
+      - name: Check out
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # 1. Line endings. A script committed with CRLF ("#!/bin/zsh\r") fails with exit code 126 on Linux. Strip the CR from every text file the build reads
+      #    (the repository should also carry .gitattributes so it does not come back: see the notes).
+      - name: Normalise line endings and permissions
+        run: |
+          git ls-files -z -- '*.sh' '*.py' '*.tsv' '*.gradle' '*.properties' '*.cs' '*.csproj' '*.props' '*.targets' '*.c' '*.h' '*.inc' '*.java' '*.xml' '*.txt' '*.cmake' 'android/app/gradlew' \
+            | xargs -0 -r grep -lIZ $'\r' 2>/dev/null | xargs -0 -r sed -i 's/\r$//' || true
+          echo "files that still contain a CR: $(git ls-files -z -- '*.sh' 'android/app/gradlew' '*.gradle' | xargs -0 -r grep -lI $'\r' 2>/dev/null | wc -l)"
+          chmod +x android/app/gradlew android/ondevice/build.sh dm/gfx/tools/dmsh_xlate_android/*.sh dm/third_party/zstd-zbic/build.sh
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '21'
-          distribution: 'temurin'
+          cache: gradle
 
-      - name: Build ondevice native packer
-        working-directory: ./android
+      # The translator (libdmsh_xlate.so) is built with the .NET 10 SDK
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # android/ondevice/build.sh and the scripts it calls are zsh scripts (written on a Mac): zsh is not on the runner
+      - name: Install build tools
         run: |
-          find . -name "*.sh" -exec sed -i 's/\r$//' {} +
-          chmod +x ondevice/build.sh
-          bash ./ondevice/build.sh work
+          sudo apt-get update
+          sudo apt-get install -y zsh ninja-build cmake python3 curl perl clang lld zlib1g-dev
+          command -v shasum >/dev/null || sudo apt-get install -y libdigest-sha-perl
+          zsh --version; shasum --version | head -1; python3 --version; dotnet --version
 
-      - name: Make gradlew executable
-        working-directory: ./android/app
+      - name: Install Android SDK parts
         run: |
-          sed -i 's/\r$//' gradlew
-          chmod +x gradlew
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          ls "$ANDROID_HOME/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/"
 
-      - name: Build Banana Splint Native APK
-        working-directory: ./android/app
-        run: ./gradlew assembleDebug -PnxLabel="Banana Splint Native" -PnxPackStage=../work/stage -PnxPackEngine=native
+      - name: Cache the packer's downloads
+        uses: actions/cache@v4
+        with:
+          path: work/dl
+          key: nxpack-dl-${{ hashFiles('android/ondevice/build.sh') }}
 
-      - name: Upload Banana Splint Native APK
+      # 2. The native side of the on-device packer: CPython 3.14 for Android, Capstone, lz4, libnxpack.so, libzbicdec.so, libcra.so, the translator and SPIRV-Tools.
+      #    Without it the APK has no libnxpack.so and the phone says "no library in .../ondevice/lib". Run through `zsh` (not ./build.sh): no exec bit or shebang is needed.
+      - name: Build the packer's native stage (android/ondevice/build.sh)
+        run: |
+          mkdir -p "$WORK"
+          zsh android/ondevice/build.sh "$WORK" all 2>&1 | tee "$WORK/ondevice-build.log"
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Check the stage
+        run: |
+          missing=0
+          for f in lib/libpython3.14.so lib/libnxpack.so lib/libzbicdec.so lib/libcra.so lib/libdmsh_xlate.so lib/libSPIRV-Tools-shared.so python/lib/python3.14/os.py; do
+            if [ -f "$WORK/stage/$f" ]; then echo "ok      $f"; else echo "MISSING $f"; missing=1; fi
+          done
+          exit $missing
+
+      # 3. The APK: a release build (optimised native code), signed with the debug key so it installs; the native packer, not -PnxPackEngine=fake.
+      #    -PnxApp=splint makes a separate app (dev.nxnative.android.splint) named by -PnxLabel.
+      - name: Build the APK
+        working-directory: android/app
+        run: |
+          ARGS=(-PnxApp=splint "-PnxLabel=${APP_LABEL}" -PnxPackEngine=native "-PnxPackStage=${WORK}/stage")
+          if [ "$GAMES" != "all" ]; then ARGS+=("-PnxGames=${GAMES}"); fi
+          ./gradlew --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx4g assembleRelease "${ARGS[@]}"
+
+      - name: Check that the real packer is in the APK
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          unzip -l "$APK" > apk.lst
+          for f in libnxpack.so libpython3.14.so libdmsh_xlate.so libSPIRV-Tools-shared.so libzbicdec.so libcra.so; do
+            grep -q "lib/arm64-v8a/$f" apk.lst && echo "ok      $f" || { echo "MISSING $f in the APK"; exit 1; }
+          done
+          for f in assets/pack/python.zip assets/pack/tools.zip; do
+            grep -q "$f" apk.lst && echo "ok      $f" || { echo "MISSING $f in the APK"; exit 1; }
+          done
+          cp "$APK" "Banana-Splint-Native.apk"
+
+      - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
-          name: Banana-Splint-Native
-          path: android/app/build/outputs/apk/**/*.apk
+          name: Banana-Splint-Native-apk
+          path: Banana-Splint-Native.apk
+          if-no-files-found: error
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            work/ondevice-build.log
+            work/*.log
+            work/build/*.log
+            work/xlate/**/*.log
+            work/spvtools/*.log
+            android/app/build/reports
+          if-no-files-found: ignore
