@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Banana Splint Native Build
 
 on:
   workflow_dispatch:
@@ -20,12 +20,12 @@ jobs:
         working-directory: ./android/app
         run: chmod +x gradlew
 
-      - name: Build Debug APK
+      - name: Build Banana Splint Native APK
         working-directory: ./android/app
-        run: ./gradlew assembleDebug -PnxPackStage=ondevice -PnxPackEngine=real
+        run: ./gradlew assembleDebug -PnxPackStage=NOME_DO_STAGE -PnxPackEngine=NOME_DO_ENGINE
 
-      - name: Upload APK
+      - name: Upload Banana Splint Native APK
         uses: actions/upload-artifact@v4
         with:
-          name: BananaNative-Mali-APK
+          name: Banana-Splint-Native
           path: android/app/build/outputs/apk/**/*.apk
