@@ -18,9 +18,11 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Prepare ondevice stage directory
+      - name: Build ondevice native packer
         working-directory: ./android
-        run: mkdir -p ondevice/stage
+        run: |
+          chmod +x ondevice/build.sh
+          ./ondevice/build.sh work
 
       - name: Make gradlew executable
         working-directory: ./android/app
@@ -28,7 +30,7 @@ jobs:
 
       - name: Build Banana Splint Native APK
         working-directory: ./android/app
-        run: ./gradlew assembleDebug -PnxLabel="Banana Splint Native" -PnxPackStage=../ondevice/stage -PnxPackEngine=native
+        run: ./gradlew assembleDebug -PnxLabel="Banana Splint Native" -PnxPackStage=../work/stage -PnxPackEngine=native
 
       - name: Upload Banana Splint Native APK
         uses: actions/upload-artifact@v4
