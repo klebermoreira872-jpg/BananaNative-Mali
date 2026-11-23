@@ -1,5 +1,6 @@
 name: Build Android APK
 
+
 on:
   workflow_dispatch:
 
@@ -22,7 +23,7 @@ jobs:
 
       - name: Build Debug APK
         working-directory: ./android/app
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug -PPnxPackEngine=fake
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
