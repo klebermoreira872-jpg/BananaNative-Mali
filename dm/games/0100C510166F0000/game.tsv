@@ -1,0 +1,49 @@
+# Provisional game profile of Chained Echoes (Switch, base game v0 + update v1310720 + the Ashes of Elrant DLC), Unity 2020.3.36f1 IL2CPP, SDK 14.3.0, NVN. Written by Peanuts Native from a survey of
+# the game files with dm/games/profile_guess.py; booted on Android only, in Peanuts Native (an AYN Thor, the opening), where the pool was measured. Every key marked "guess" follows a rule
+# or a sibling profile and is not measured. README.md beside this file.
+# Format: see dm/games/README.md
+
+# ---- Identity ----
+title_id	0100C510166F0000
+program_id	0100C510166F0000
+
+# ---- App ----
+name	Chained Echoes
+ipa	ChainedEchoes.ipa
+app_category	public.app-category.role-playing-games
+# guess: a 2D role-playing game moved with the stick or the D-pad; the 3D layout has the D-pad. Nothing in the files decides it
+pad_layout	full
+
+# ---- Versions ----
+# The display version was not read (the import keeps no control data)
+build	v1310720	?	main=17b6a110cc529fbe702b09f1ba1da61d	subsdk0=c781dd63daf0ddcdb9975da50a198f93	sdk=2aef2cffb104ee7c9e212fd2f4c731e9
+package	v1310720
+shader_versions	v1310720
+
+# ---- Files ----
+# load order as on Horizon: main, subsdk0, sdk. subsdk0 is NintendoSDK_movie: main takes 25 functions from it (movie::Extractor, movie::Decoder: Unity's video player), none of which
+# the host supplies itself
+modules	main subsdk0 sdk
+# the file every Unity player has (as the other Unity profiles); profile_guess.py's rule would name the largest file, a music bundle
+romfs_marker	Data/globalgamemanagers
+# the file types that are big or already compressed (profile_guess.py's rule)
+zip_store	.bundle:.resource:.ress:.assets:.dat:.metallib
+
+# ---- Memory ----
+# The NPDM declares 16 MB of system resource, so there is virtual address memory: nninitStartup hands pool - used to StandardAllocator as one address region (it returns to
+# main+0x322910) and Unity reserves its own regions beside it; main also imports nn::os::SetMemoryHeapSize. The block is profile_guess.py's 5 GB one (256 MB in front + 4.375 GB alias
+# region + 256 MB stack region + 128 MB heap region), not measured against another. The pool was measured in Peanuts Native on an AYN Thor (2026-11-16): with 1 GB the pool was full
+# 4.6 s after the start (eight refused MapPhysicalMemory at 0.93 GB mapped) and the game crashed at main+0x813a3c before its first picture; with 2 GB (Advance Wars 1+2: Re-Boot Camp's)
+# the title, a new game and the first two scenes ran with 1.75 GB mapped at most, the alias region used up to +3.51 GB of 4.38 GB, and no refusal. Upstream nxnative's profile of
+# update 1.1.1 has the hardware pool (3.2 GB), run on the Mac only (alias region up to +3.5 GB of 64 GB): here StandardAllocator's region would be 1.2 GB larger, and
+# +3.51 GB + 1.2 GB is past the 4.375 GB alias region (not run). The sdk build (2aef2cff…) takes the SDK-wide node area cut and 2 MB region alignment (dm/tools/sdk_patches.py). README.md has the runs
+sys_resource	0x1000000
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0x80000000
+
+# ---- Shader split (shader_split.py; Unity Shader objects, read by unityfs.py) ----
+# guess (Fire Emblem Engage's groups, the other Unity 2020.3 game with Addressables): engine built-ins (Resources/) go to engine, the Addressables bundles to assets, the player's serialized files to data
+shader_groups	/Resources/=engine /StreamingAssets/=assets /Data/=data
+shader_note	Chained Echoes shaders (provisional profile)

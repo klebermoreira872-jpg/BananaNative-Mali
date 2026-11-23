@@ -1,0 +1,170 @@
+// Clock snapshot arithmetic (hle_time.c, from PR #36): CalculateSpanBetween and CalculateStandardUserSystemClockDifferenceByUser looked up by their mangled names in the real swforce
+// registrations, run on both host snapshot entries and on edited copies; the C library's local-time functions, UTC as on a Switch, against nn::time's local conversion (issue #2784)
+#include "../hle_time.c"
+#include "../hle_net.c"   // DM_ONLINE: nifm proxy setting and nsd name resolution
+#include <mach-o/getsect.h>
+
+void dm_guest_sleep_ns(int64_t ns) { (void)ns; }   // hle_net.c (socket Poll) links these
+uint64_t guest_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
+static int checks, fails;
+extern const struct mach_header_64 _mh_execute_header;
+#define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
+static void *hook(const char *name) {
+    unsigned long bytes = 0;
+    const hle_force_ent *e = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &bytes);
+    void *fn = NULL; unsigned count = 0;
+    for (size_t i = 0; e && i < bytes / sizeof *e; i++) if (!strcmp(e[i].name, name)) { count++; fn = (void *)e[i].fn; }
+    CHECK(count == 1 && fn, name);
+    return count == 1 ? fn : NULL;
+}
+static void *section_fn(const char *sect, const char *name, unsigned *count) {
+    unsigned long bytes = 0; void *fn = NULL; *count = 0;
+    const hle_ent *e = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", sect, &bytes);   // hle_force_ent and hle_ent both begin {name, fn}
+    size_t step = !strcmp(sect, "swforce") ? sizeof(hle_force_ent) : sizeof(hle_ent);
+    for (size_t i = 0; e && i < bytes / step; i++) { const hle_ent *x = (const hle_ent *)((const char *)e + i * step); if (!strcmp(x->name, name)) { ++*count; fn = x->fn; } }
+    return fn;
+}
+// The C library's local time is UTC (the SDK's own functions run; the pass-through table maps to the host's UTC ones), nn::time's is the host zone's
+static void check_utc_libc(void) {
+    static const char *names[] = {"localtime", "localtime_r", "mktime"}; unsigned n;
+    for (int i = 0; i < 3; i++) { section_fn("swforce", names[i], &n); CHECK(n == 0, "the SDK's localtime / localtime_r / mktime are not taken over"); }
+    setenv("TZ", "Asia/Seoul", 1); tzset();
+    int64_t (*mk)(struct tm *) = section_fn("swhle", "mktime", &n);
+    struct tm *(*lt)(const int64_t *, struct tm *) = section_fn("swhle", "localtime_r", &n);
+    const int64_t save = 1794761043;   // Hades II's save header time, 2026-11-15 16:44:03 UTC
+    struct tm u; time_t sv = (time_t)save; gmtime_r(&sv, &u);
+    CHECK(mk && mk(&u) == save, "mktime of a UTC struct tm gives the time back unchanged (TZ=Asia/Seoul)");
+    struct tm l; CHECK(lt && lt(&save, &l) == &l && l.tm_hour == 16 && l.tm_min == 44 && l.tm_gmtoff == 0, "localtime_r is UTC (TZ=Asia/Seoul)");
+    Result (*cal)(CalendarTime *, CalendarAdditionalInfo *, const int64_t *) = hook("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE");
+    CalendarTime ct; CalendarAdditionalInfo ai;
+    CHECK(cal && cal(&ct, &ai, &save) == RES_OK && ct.day == 16 && ct.hour == 1 && ct.minute == 44 && ai.offset == 9 * 3600, "ToCalendarTime converts in the host zone (01:44 KST)");
+    setenv("TZ", "UTC", 1); tzset();
+}
+// The SDK's detail:: periodic benefit claim, as guest_sym finds it: records what the host's public entry passed on and answers 7
+static const void *claim_args[5];
+static uint64_t fake_claim(void *ctx, const uint8_t *snap, const int64_t *max_penalty, const int64_t *acceptable, const void *callback) {
+    claim_args[0] = ctx; claim_args[1] = snap; claim_args[2] = max_penalty; claim_args[3] = acceptable; claim_args[4] = callback; return 7;
+}
+void *guest_sym(const char *name) {
+    return !strcmp(name, "_ZN2nn4time6detail39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicBenefitClaimContextERKNS0_13ClockSnapshotERKNS_8TimeSpanES9_PKNS0_25CheckCalendarTimeCallbackE") ? (void *)fake_claim : NULL;
+}
+static void put64(uint8_t *s, int off, int64_t v) { memcpy(s + off, &v, 8); }
+static int64_t get64(const uint8_t *s, int off) { int64_t v; memcpy(&v, s + off, 8); return v; }
+int main(void) {
+    Result (*snap)(uint8_t *) = hook("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_");
+    Result (*adj_snap)(uint8_t *) = hook("_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_");
+    unsigned (*span)(int64_t *, const uint8_t *, const uint8_t *) = hook("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_");
+    int64_t (*udiff)(const uint8_t *, const uint8_t *) = hook("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_");
+    check_utc_libc();
+    if (!snap || !adj_snap || !span || !udiff) { printf("time: %d checks, %d failed\n", checks, fails); return 1; }
+    uint8_t a[0xd0], b[0xd0], c[0xd0]; int64_t ts = -1;
+    // Before the first snapshot: h_time_GetCurrentTime reads DM_FIXED_TIME once and caches it
+    setenv("DM_FIXED_TIME", "1700000000", 1);
+    setenv("DM_ONLINE", "1", 1);   // read once: the network clock then follows the user clock
+    setenv("TZ", "UTC", 1); tzset();
+    {   // DM_ONLINE=1: the network clock reads the user clock and is accurate (offline both fail)
+        Result (*net)(int64_t *) = hook("_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE");
+        unsigned (*acc)(void) = hook("_ZN2nn4time26StandardNetworkSystemClock20IsAccuracySufficientEv");
+        int64_t nt = 0;
+        CHECK(net && net(&nt) == RES_OK && nt == 1700000000, "online: the network clock is the user clock");
+        CHECK(acc && acc() == 1, "online: the network clock is accurate");
+    }
+    {   // DM_ONLINE=1: the proxy query succeeds with no proxy, the nsd resolution keeps the name (offline both fail)
+        Result (*proxy)(void *) = hook("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE");
+        Result (*resex)(void *, const void *) = hook("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_");
+        Result (*res)(void *, const void *) = hook("_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_");
+        uint8_t ps[0xaa]; memset(ps, 0xaa, sizeof ps);
+        CHECK(proxy && proxy(ps) == RES_OK && ps[0] == 0 && ps[0xa9] == 0, "online: no proxy, buffer cleared");
+        char in[256] = "receive-lp1.dg.srv.nintendo.net", out[256]; memset(out, 0x7f, sizeof out);
+        CHECK(resex && resex(out, in) == RES_OK && !strcmp(out, in) && out[255] == 0, "online: ResolveEx keeps the name");
+        CHECK(res && res(out, in) == RES_OK && !strcmp(out, in), "online: Resolve keeps the name");
+        CHECK(resex && resex(NULL, in) != RES_OK, "online: ResolveEx without a buffer fails");
+    }
+    CHECK(snap(a) == RES_OK, "snapshot a");
+    CHECK(a[0xcd] == 1, "standard snapshot type is 1");
+    // Both entries must stay inside the SDK's 0xd0-byte buffer, including the type near its end.
+    uint8_t guarded[0xf0]; memset(guarded, 0xa5, sizeof guarded);
+    uint8_t *adjustable = guarded + 0x10;
+    CHECK(snap(adjustable) == RES_OK, "standard snapshot in guarded buffer");
+    int standard_guards_ok = 1;
+    for (int i = 0; i < 0x10; i++) standard_guards_ok &= guarded[i] == 0xa5 && guarded[0xe0 + i] == 0xa5;
+    CHECK(standard_guards_ok, "standard snapshot writes only its 0xd0 bytes");
+    memset(guarded, 0xa5, sizeof guarded);
+    CHECK(adj_snap(adjustable) == RES_OK, "adjustable snapshot");
+    int guards_ok = 1;
+    for (int i = 0; i < 0x10; i++) guards_ok &= guarded[i] == 0xa5 && guarded[0xe0 + i] == 0xa5;
+    CHECK(guards_ok, "adjustable snapshot writes only its 0xd0 bytes");
+    CHECK(adjustable[0xcd] == 2, "adjustable snapshot type is 2");
+    CHECK(get64(adjustable, 0x40) == 1700000000, "adjustable user time follows the host clock");
+    Result (*net)(int64_t *) = hook("_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE");
+    int64_t nt = -1;
+    CHECK(net && net(&nt) == RES_OK && nt == 1700000000, "the network clock reads the host clock, as the user clock (saves are dated by it)");
+    const CalendarTime *cal = (const CalendarTime *)(adjustable + 0x50);
+    CHECK(cal->year == 2023 && cal->month == 11 && cal->day == 14 && cal->hour == 22 && cal->minute == 13 && cal->second == 20,
+          "adjustable snapshot has the UTC calendar for the fixed time");
+    CHECK(!memcmp(adjustable + 0x20, adjustable, 0x20) && get64(adjustable, 0x48) == 1700000000 && !memcmp(adjustable + 0x58, adjustable + 0x50, 8) &&
+          !memcmp(adjustable + 0x78, adjustable + 0x60, 0x18), "snapshot network fields are the user clock's (context, time, calendar, its info)");
+    int64_t (*net_now)(void) = hook("_ZN2nn4time26StandardNetworkSystemClock3nowEv");
+    CHECK(net_now && net_now() == 1700000000, "the network clock's now() reads the host clock, as GetCurrentTime does");
+    CHECK(!memcmp(a + 0x98, adjustable + 0x98, 16), "both snapshots use the same steady clock source");
+    CHECK(udiff(a, adjustable) == 0, "changing snapshot type does not report a user clock change");
+    CHECK(!strcmp((const char *)adjustable + 0xa8, "UTC"), "adjustable snapshot carries the host time zone");
+    memcpy(b, a, sizeof b); b[0xcd] = 2;
+    CHECK(span(&ts, a, b) == 1 && ts == 0, "changing only the type leaves the elapsed span at zero");
+    unsetenv("DM_FIXED_TIME");
+    CHECK(span(&ts, a, a) == 1 && ts == 0, "span of a snapshot with itself is 0");
+    memcpy(b, a, sizeof b); put64(b, 0x90, get64(a, 0x90) + 90);   // b: 90 s of steady clock later
+    CHECK(span(&ts, a, b) == 1 && ts == 90 * 1000000000LL, "span from the steady time points, in nanoseconds");
+    CHECK(span(&ts, b, a) == 1 && ts == -90 * 1000000000LL, "span backwards is negative");
+    memcpy(c, b, sizeof c); c[0x98] ^= 1; ts = 1234;   // c: another steady clock source, no network time
+    put64(a, 0x48, 0); put64(c, 0x48, 0);   // as a snapshot made with no network clock
+    CHECK(span(&ts, a, c) == 0 && ts == 1234, "different sources and no network time: false, output untouched");
+    put64(a, 0x48, 1000); put64(c, 0x48, 1600);   // with network times the span comes from them
+    CHECK(span(&ts, a, c) == 1 && ts == 600 * 1000000000LL, "different sources: span from the network times");
+    CHECK(snap(a) == RES_OK && snap(b) == RES_OK && udiff(a, b) == 0, "two host snapshots in a row: the user did not move the clock");
+    memcpy(b, a, sizeof b); put64(b, 0x00, get64(a, 0x00) + 3600);   // b: the user clock offset one hour later
+    CHECK(udiff(a, b) == 3600 * 1000000000LL, "user clock moved an hour");
+    b[0x10] ^= 1; CHECK(udiff(a, b) == 0, "user contexts of different steady sources: 0");
+    b[0x10] ^= 1; a[0xcc] = b[0xcc] = 1; CHECK(udiff(a, b) == 0, "automatic correction on in both: 0");
+    a[0xcc] = 0; CHECK(udiff(a, b) == 3600 * 1000000000LL, "automatic correction in one only: the difference");
+    // The network clock's context and the adjustable clocks (PR #1875): each is the user clock in every reader, its context the snapshot's, within the context's 0x20 bytes
+    // (DM_FIXED_TIME is read once, above, so the clocks still read 1700000000)
+    static const char *ctx_hooks[] = {
+        "_ZN2nn4time26StandardNetworkSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE",
+        "_ZN2nn4time25AdjustableUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE",
+        "_ZN2nn4time28AdjustableNetworkSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE"};
+    CHECK(snap(a) == RES_OK, "snapshot for the contexts");
+    for (int h = 0; h < 3; h++) {
+        Result (*get_ctx)(uint8_t *) = hook(ctx_hooks[h]);
+        uint8_t g[0x40]; memset(g, 0xa5, sizeof g);
+        int ok = get_ctx && get_ctx(g + 0x10) == RES_OK && !memcmp(g + 0x10, a, 0x20) && !memcmp(g + 0x10, a + 0x20, 0x20);
+        for (int i = 0; i < 0x10; i++) ok &= g[i] == 0xa5 && g[0x30 + i] == 0xa5;
+        CHECK(ok, ctx_hooks[h]);
+    }
+    Result (*adj_net)(int64_t *) = hook("_ZN2nn4time28AdjustableNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE");
+    nt = -1; CHECK(adj_net && adj_net(&nt) == RES_OK && nt == 1700000000, "the adjustable network clock reads the host clock");
+    int64_t (*adj_now)(void) = hook("_ZN2nn4time25AdjustableUserSystemClock3nowEv");
+    int64_t (*adj_net_now)(void) = hook("_ZN2nn4time28AdjustableNetworkSystemClock3nowEv");
+    CHECK(adj_now && adj_now() == 1700000000 && adj_net_now && adj_net_now() == 1700000000, "the adjustable clocks' now() read the host clock");
+    int (*net_ts)(int64_t *) = hook("_ZN2nn4time44GetStandardNetworkSystemClockCurrentTimespecEP8timespec");
+    int (*adj_net_ts)(int64_t *) = hook("_ZN2nn4time46GetAdjustableNetworkSystemClockCurrentTimespecEP8timespec");
+    int64_t tsp[2] = {-1, -1}, tsq[2] = {-1, -1};
+    CHECK(net_ts && net_ts(tsp) == 0 && tsp[0] == 1700000000 && tsp[1] == 0 && adj_net_ts && adj_net_ts(tsq) == 0 && tsq[0] == 1700000000 && tsq[1] == 0,
+          "the network clocks' real-time getters read the host clock");
+    // The periodic benefit claim skips the SDK's time service session check and hands every argument to its detail:: implementation, whose answer it returns
+    uint64_t (*claim)(void *, const uint8_t *, const int64_t *, const int64_t *, const void *) =
+        hook("_ZN2nn4time39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicBenefitClaimContextERKNS0_13ClockSnapshotERKNS_8TimeSpanES8_PKNS0_25CheckCalendarTimeCallbackE");
+    uint8_t ctx[0x100] = {0}; int64_t pen = 1, acc = 2; int cbk = 0;
+    CHECK(claim && claim(ctx, a, &pen, &acc, &cbk) == 7, "periodic benefit claim returns the SDK implementation's answer");
+    CHECK(claim_args[0] == ctx && claim_args[1] == a && claim_args[2] == &pen && claim_args[3] == &acc && claim_args[4] == &cbk, "periodic benefit claim passes every argument on");
+    // Its two service questions: the location the host's snapshots carry, and time points of no clock (a source ID no snapshot has)
+    Result (*auto_upd)(uint8_t *) = hook("_ZN2nn4time6detail56GetStandardUserSystemClockAutomaticCorrectionUpdatedTimeEPNS0_20SteadyClockTimePointE");
+    Result (*loc_upd)(char *, uint8_t *) = hook("_ZN2nn4time6detail35GetDeviceLocationNameAndUpdatedTimeEPNS0_12LocationNameEPNS0_20SteadyClockTimePointE");
+    uint8_t tp[0x18], none[0x18] = {0}; char loc[0x24];
+    memset(tp, 0xaa, sizeof tp); CHECK(auto_upd && auto_upd(tp) == RES_OK && !memcmp(tp, none, sizeof tp), "automatic correction updated time: a cleared time point");
+    memset(tp, 0xaa, sizeof tp); memset(loc, 0xaa, sizeof loc);
+    CHECK(loc_upd && loc_upd(loc, tp) == RES_OK && !memcmp(loc, a + 0xa8, sizeof loc) && !memcmp(tp, none, sizeof tp), "device location: the snapshot's name, a cleared time point");
+    CHECK(memcmp(tp + 8, a + 0x90 + 8, 16), "the cleared time point's source ID is not the snapshots' steady clock");
+    printf("time: %d checks, %d failed\n", checks, fails);
+    return fails != 0;
+}

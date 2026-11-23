@@ -1,0 +1,15 @@
+# What this game needs of an Android phone, for the launcher's readiness check (android/README.md "Readiness check"; the format in dm/games/README.md "Readiness rows").
+# A status row also marks the game as supported on Android: gradle.properties' nxGames builds every such profile into the APK (dm/tools/tests/test_android_games.py).
+
+# Bring-up on Android: on the AYN Odin 3 (Adreno 830) title, menus and the first races play at about 60 fps on the system driver and on Turnip v32 (the note, Android);
+# longer play, later courses and multiplayer are not tested yet
+status	bring-up
+# <required|degraded> <TAB> <fact> <TAB> <at least> <TAB> <title>: <why>. Feature rows from dm/tools/library_caps.py on the game's library (2,914 modules; no mesh or task
+# programs build on this chain, and the game makes no mesh draws on the tested route)
+required	feature.shaderDrawParameters	1	Shader draw parameters: every vertex shader of the game reads them
+degraded	feature.geometryShader	1	Geometry shaders: 13 of the game's shader modules use them; without them those draws are skipped
+degraded	feature.shaderStorageImageWriteWithoutFormat	1	Storage image writes without a format: 39 of the game's shaders use them
+degraded	feature.shaderStorageImageReadWithoutFormat	1	Storage image reads without a format: 4 of the game's shaders use them
+degraded	limit.maxComputeSharedMemorySize	32736	Compute shared memory: one of the game's compute shaders takes 32,736 bytes
+# Memory on the Odin 3 (24 GB), three races: the host's own footprint up to about 1 GB on the system driver and 3 GB on Turnip v32, GPU memory up to about 4.6 GB on both
+degraded	ram_gib	10	Memory: the game keeps up to about 5.5 GB in use on the phone's own driver and 7.5 GB on Turnip; it is tested on a 24 GB phone only

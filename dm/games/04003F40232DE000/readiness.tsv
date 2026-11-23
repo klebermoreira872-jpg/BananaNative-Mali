@@ -1,0 +1,14 @@
+# What this game needs of an Android phone, for the launcher's readiness check (android/README.md "Readiness check"; the format in dm/games/README.md "Readiness rows").
+# A status row also marks the game as supported on Android: gradle.properties' nxGames builds every such profile into the APK (dm/tools/tests/test_android_games.py).
+
+# Bring-up on Android: on a 16 GB AYN Thor (Adreno 740, Turnip 27.0.0-devel) first-run settings, the opening VP9 movie, realtime cutscenes and the first 3D forest field play at
+# 52-56 fps (the note, Android); combat encounters, mid-mission autosave reload and Qualcomm's system driver are not tested yet
+status	bring-up
+
+# Compute shared memory from shader_facts.tsv (101,860 shaders, 0 mesh or task programs): 160 compute shaders ask for more than 32,768 bytes (up to 48,128 bytes); none of the
+# 15,449 shaders in shader_seen.tsv (boot to the first field) ask for more than 14,896 bytes
+degraded	limit.maxComputeSharedMemorySize	48128	Compute shared memory: 160 of the game's compute shaders take up to 48,128 bytes (none of the 15,449 shaders from boot to the first field take more than 14,896 bytes)
+
+# Memory on the 16 GB AYN Thor (14.9 GiB totalMem) in the first field (frame 20,812): 6.85 GiB PSS / 6.96 GiB RSS, 5.90 GiB MemAvailable
+required	ram_gib	10	Memory: the game keeps about 7 GB resident while playing, which a phone with less than about 12 GB cannot give it
+degraded	ram_gib	14	Memory: verified on a 16 GB handheld only; with less, Android may stop the game when memory runs short

@@ -1,0 +1,1350 @@
+# Services and SDK calls
+
+SDK calls and system services the host answers (`dm/host/hle_*.c`). Each entry: symptom, cause, fix, the games it was found on. The [symptom index](../agents/symptoms.md) lists every symptom.
+
+## Service connections
+
+### SDK calls that open a system service through sm
+
+- **Symptom:** `sm::Initialize` aborts right after `ConnectToNamedPort` (SVC 0x1F) and `SendSyncRequest` (0x21); abort inside `nn::sm::Initialize`, the log showing `SVC 0x1f` (ConnectToNamedPort, port name `sm:`) and `SVC 0x21` answered by placeholders, then an `nn::diag` abort; abort with no message at start-up in a service call the host has no hook for (`Break` from `sdk+…` with an `nn::diag` backtrace).
+- **Cause:** an SDK path reached a system service the host doesn't replace: the SDK's IPC to the service fails and it calls `AbortImpl`. Often it is an SDK call the host does not hook, for example a newer overload of a hooked call.
+- **Fix:** hook the public SDK entry point named in the backtrace (`HLE_FORCE` in the relevant `hle_*.c`). Symbolize the abort backtrace against the SDK's exports to find the caller (resolve the frames with `sdis.py --sym` on the decompressed module) and hook that name. List the game's imports of that service the host does not hook ([Listing a game's unhooked imports before they are met](#listing-a-games-unhooked-imports-before-they-are-met)) and add the ones that talk to a service; library helpers that only fill the game's own buffers need nothing. Look at how the game uses the result before choosing it (a `bcat` mount failure is the game's own "nothing delivered" path).
+- **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md) (SDK 18): `nn::hid::InitializeTouchScreen(int, int)`, the SDK 18 overload of the hooked `InitializeTouchScreen()`; [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (SDK 7): `account::OpenPreselectedUser`, then `bcat::Initialize`, then `audio::AcquireAudioDeviceSwitchNotification`, and a null read in `account::GetLastOpenedUser`.
+- **Note:** the same abort from other services: `ec::InitializeForShopServiceAccessors` ([Shop service accessors](#shop-service-accessors)), `pctl::IsFreeCommunicationAvailable` ([Parental controls and free communication](#parental-controls-and-free-communication)), `oe::FinishStartupLogo` ([The startup logo](#the-startup-logo)), `hid::VibrationNode::Update` ([Vibration values flushed by the SDK's vibration graph](#vibration-values-flushed-by-the-sdks-vibration-graph)), `audio::GetAudioDeviceOutputVolume` ([Audio device output volume and names](audio.md#audio-device-output-volume-and-names)), `capsrv::InitializeForApplication` ([Album calls fail with no album](#album-calls-fail-with-no-album)), `settings::LanguageCode` ([Language codes](#language-codes)), and the rest of this file.
+
+### SDK 3.6.0 answered as SDK 4
+
+- SDK 3.6.0 booted to its frame loop with the provisional profile as generated and no host change: the services, the NVN API version (53, as for every SDK up to 10), the audio output and the heap all answered as for SDK 4.
+- **Found on:** [Bayonetta 2](../../dm/games/01007960049A0000/README.md) (PlatinumGames' engine in its Wii U form): what it needed was graphics ([Clears of attachments larger than the render pass](rendering.md#clears-of-attachments-larger-than-the-render-pass), [`Downsample` of a single-sample texture](rendering.md#downsample-of-a-single-sample-texture)) and a reader for its CRI CPK archives ([BNSH files in PlatinumGames DAT archives inside CRI CPK archives](shaders.md#bnsh-files-in-platinumgames-dat-archives-inside-cri-cpk-archives)); [Bayonetta](../../dm/games/010076F0049A2000/README.md), on the same `sdk` and `subsdk0` builds, then needed no change at all (its profile is Bayonetta 2's with its own build row and tables, and the route from the boot to the first fight logged no red line). [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md)'s SDK 3.5.1 answered as SDK 4 as well (NVN 53.313); its audio renderer needed the update lock found without `SdkMutexType` ([No `SdkMutexType` in SDK 3](audio.md#no-sdkmutextype-in-sdk-3)).
+
+### Listing a game's unhooked imports before they are met
+
+Most service calls can be found before they crash, before the first boot or the next one: the calls that would abort in `sm::Initialize` (or read a null service object) are in the import list.
+
+- **Procedure:** list `main`'s `nn::` imports (its undefined imports) that no host hook names, by namespace: the survey's import table (`nso_syms.py`), then `main`'s undefined `nn::` symbols that no hook (`HLE` / `HLE_FORCE`) names ([02](../agents/02-survey.md#imports-vs-host-hooks)), and read each one's SDK code. This gives the calls a game will make before they are met. The import list itself says where to look: diff the undefined symbols against the closest title the host already runs (and every other game's imports), drop what the host hooks, and the rest are the candidates. To find which `sdk` function aborted, map the backtrace offsets to the nearest exported symbol ([The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) 1.4.3).
+- **What needs nothing:** most `nn::os` / `nn::mem` imports run natively in `sdk`. Calls that are pure computations need nothing, nor do socket calls behind a `Socket()` that already fails offline, nor library helpers that only fill the game's own structures.
+- **Hook names:** hooks are `HLE_FORCE`, `SSF`, `SKF`, `IKB_IGNORE` across `dm/host` and `dm/gfx`. `strings` misses names the symbol table stores as the tail of a longer one, so list them with `nso_syms.dynsyms`.
+- **The survey table's blind spots:** it counts only names given to `HLE` / `HLE_FORCE` directly: hooks made through macros (`SKF` and `SSF` in `hle_net.c`, `TOUCH(N)` in `hle_hid.c`) show as missing. The touch-screen states (`GetTouchScreenState<16>`) were already hooked by such a macro, which the import table does not see. It once listed every vi call as unhooked: `nso_syms.py host_hooks` read only `dm/host`, and the vi hooks are in `dm/gfx` (it reads `dm/gfx` and `dm/gfx/nvn` now; found on [Absolum](../../dm/games/0100A83022A22000/README.md)).
+- **What it found** (the calls themselves are in the entries of their service below):
+  - [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) (SDK 7, one boot each): the import list against the hooks and every other game's imports named all of them beforehand: 33 `nn::` imports no host hook names and no other game imports.
+  - [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11).
+  - [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11, one boot each): the import list against the hooks and the other SDK 11 games found most of them before the first boot.
+  - [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md).
+  - [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md): the pure computations were the swkbd presets, the web argument constructors, `time::GetDayOfWeek` and the audio resampler.
+  - [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (SDK 19.3.1): the import list against the hooks gave the rest before they were met; the rest fill the game's own structures or sit behind a socket that fails offline.
+  - [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11): the import list against the hooks (the survey's `nso_syms.py` table, then `main`'s undefined `nn::` symbols that no `HLE_FORCE` names) left 86 candidates; most only fill the game's own structures (error and web argument builders, `prepo` report buffers, `swkbd` configuration, the audio resampler, `nn::async`). The ones that reach a service were hooked before they were met where the answer is clear: `time::ToPosixTime` with an explicit rule, `album::SaveCurrentScreenshot`, `err::ShowApplicationError` and the `ShowShopAddOnContentList(UserHandle)` overload.
+  - [STEINS;GATE RE:BOOT](../../dm/games/01008BC024FDE000/README.md) (SDK 20.5.17): `nn::audio::SetAudioOutVolume` ([AudioOut volume kept per output](audio.md#audioout-volume-kept-per-output)) was among `main`'s imports that no host hook names; the others there fill the game's own structures or run in `sdk` (the CPU audio renderer, the swkbd and hid argument builders).
+  - [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) (SDK 15.3.2): `nn::settings::GetAvailableLanguageCodes` was the one import of `main` that no host hook names and that reaches a service; `fs::MountRamDisk` and the swkbd and hid helpers it also imports run in `sdk` or were never called.
+  - [Catherine: Full Body](../../dm/games/0100BF00112C0000/README.md) (SDK 8.2.1): besides `GetAvailableLanguageCodeCount`, the other imports no hook names run in `sdk` (the `LanguageCode` comparison, `ClockSnapshot`'s constructor and getters, fibers, `NumberLineAllocator`).
+  - [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (SDK 20.5.4): the clock, region and album calls under their own entries below were found in `main`'s imports before the first boot.
+  - [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1): listed after its first boot crashed in `oe::DisableAlbumImageTakenNotification`; the calls found are in the entries under `## Display, window and operation mode`, `## File system and save data` and `## Accounts, network, shop and parental controls`.
+  - [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (SDK 11.4.3).
+
+### A game update imports SDK calls the base game did not
+
+- **Symptom:** a game update aborts at boot where the base game ran.
+- **Cause:** the update imports SDK functions the base game didn't. Mario 1.2.1 added 28, among them `nn::nfp` (amiibo, initialized at boot), `pl::IsRunningOnOunce` (is this a Switch 2), `ec::ShowShopApplicationInformationForUpgrade`, `account::PopOpenUsers` and `aoc::CountAddOnContent`.
+- **Fix:** diff the undefined dynamic symbols of the two `main` modules before the first run, and read the call sites before choosing answers: Mario only reads the count from `PopOpenUsers` and falls back to `TryOpenPreselectedUser` on 0, and only counts add-on content when running on a Switch 2. The host answers as a Switch 1 with no amiibo and no add-on content (`hle_sdk16.c`, `hle_account.c`, `hle_misc.c`).
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (update 1.2.1).
+
+### Game-linked HIPC clients of system services
+
+- **Symptom:** abort in `sm::Initialize` under `sf::hipc::InitializeHipcServiceResolution`, right after the first frames (from `main+0x5b8198`); since that fix, `[RED] sf: the game connects to service <name> itself, which the host does not serve`, then an abort with `Result=0xe15` (`caps:su` in Super Smash Bros. Ultimate's single-player mode, `notif:a` when Fit Boxing 3 opens its Settings).
+- **Cause:** `main` links its own clients of `olsc:u` (cloud save data backup settings) and `npns` (push notifications), which talk HIPC through `sm` and `svcSendSyncRequest`. For each user the game asks whether backup is on and switches it off where it is (`main+0x2809c8c`); a failed connect aborts as well.
+- **Fix:** `hle_sf.c` takes over the SDK's HIPC client entry points (`InitializeHipcServiceResolution`, `ConnectToHipcService`, `SendSyncRequest`, `CloseClientSessionHandle` and the control requests `QueryPointerBufferSize`, `ConvertSessionToDomain`, `DuplicateSession(Ex)`): a service it serves (`olsc:u`) gets a host session, and every request on it succeeds with zeroed output, which reads as backup off for every user. Any other name is refused with a red line, as `sm` refuses a service nobody registered (`npns` was never connected). `DM_SF_TRACE=1` dumps each request.
+- **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (SDK 20.5.4).
+- **Fix:** `hle_sf.c` takes over the SDK's HIPC client entry points (`InitializeHipcServiceResolution`, `ConnectToHipcService`, `SendSyncRequest`, `CloseClientSessionHandle` and the control requests `QueryPointerBufferSize`, `ConvertSessionToDomain`, `DuplicateSession(Ex)`): a service it serves (`olsc:u`, the capture services below) gets a host session, and every request on it succeeds with zeroed output, which reads as backup off for every user. Any other name is refused with a red line, as `sm` refuses a service nobody registered (`npns` was never connected). `DM_SF_TRACE=1` dumps each request.
+- **Capture services:** Super Smash Bros. Ultimate links clients of `caps:su` and `caps:u` (screenshots and clips) and aborts with `Result=0xe15` when `sm` refuses them at the start of its single-player mode. The host has no album, so `caps:su`, `caps:u`, `caps:a`, `caps:c`, `caps:sc` and `caps:ss` get host sessions too: a list reads as empty and a save does nothing.
+- **Reminder alarms:** `nn::notification`'s alarm calls (`ListAlarmSettings`, `RegisterAlarmSetting`, `UpdateAlarmSetting`, `DeleteAlarmSetting`, `LoadApplicationParameter`), which most SDKs link, connect to `notif:a` on their first call and abort on any failure: Fit Boxing 3 2.0.0 (SDK 21.4.4) lists them when its Settings open. The client sends only commands 1000 (Initialize, with the process ID), 500, 510, 520, 530 and 540 (SDK 21: `sdk+0x58ac80`..`0x58ad10` in Splatoon Raiders 1.1's `sdk`); the notification event comes from `am`, not from this service. The host schedules no alarms, so `notif:a` is served: a list is empty and leaves the caller's array as it is, a registration succeeds with ID 0 and never fires, a parameter loads 0 bytes.
+- **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (SDK 20.5.4); [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (capture services); Fit Boxing 3 2.0.0 (`0100AC101BFA2000`, a provisional profile, no note: `notif:a`, PR #1974).
+
+### Mission events through `mnpp:app`
+
+- **Symptom:** `[RED] sf: the game connects to service mnpp:app itself, which the host does not serve`, then an `nn::diag` abort with Result 0xe15 (`main+0x37080`) when a game is started.
+- **Cause:** `main` links its own `mnpp:app` client, outside the host's BCAT SDK hooks, and aborts when `sm` refuses the connection ([Game-linked HIPC clients of system services](#game-linked-hipc-clients-of-system-services)). The service (13.0.0+) initializes with a PID descriptor and reserved input `u64` (command 0), then accepts a `Uid` and type-0x5 input buffer (command 1). Neither command has output; the real service creates events for later upload to Nintendo ([service contract](https://switchbrew.org/wiki/BCAT_services#mnpp:app)).
+- **Fix:** `hle_sf.c` serves `mnpp:app` through the existing success/zeroed-output response path. It is a deliberate offline stand-in: events are acknowledged and discarded, with no retained queue or upload. This fixes the missing host service at the protocol level (`host` binding), without a game or build gate. It does not implement Nintendo's event backend.
+- **Found on:** Super Nintendo Entertainment System – Nintendo Classics (`01008D300C50C000`, 6.0.0, SDK 20.5.21: starting a game from the list; its profile is not in this repository). [PR #2164](https://github.com/seedds/nxnative/pull/2164) reports the original abort and Mac gameplay with the separate friends hook and game profile; this refresh's checks use synthetic requests.
+- **Check:** `make -C dm/host/tests GAME=<id> build/t_sf`, then `dm/host/tests/build/t_sf`, checks initialization with the PID/reserved input, event submission with the `Uid` and input buffer, success without output data or handles, untouched input, and refusal of the other `mnpp` service names. The same test retains its existing offline-service, alarm and camera checks.
+
+## SDK names that changed between versions
+
+### Older SDK names for the same calls
+
+- **Symptom:** a call the host hooks under its newer name reaches the SDK's own code on an older game.
+- **Cause:** older SDKs export other names for the same calls.
+- **Fix:** hook both generations. SDK 12 names: `ListAudioDeviceName` / `GetActiveAudioDeviceName`, singular `hid::GetNpadState`, `OpenDefaultAudioOut`. SDK 11 names: `fs::CommitSaveData(mount)` is the older name of `fs::Commit`.
+- **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md) (SDK 11 names).
+- **Note:** overloads change too: SDK 18's `nn::hid::InitializeTouchScreen(int, int)` ([Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), [SDK calls that open a system service through sm](#sdk-calls-that-open-a-system-service-through-sm)), SDK 19's `LoadModule` with one more bool ([`nn::ro` and its port](#nnro-and-its-port)), and `vi::CreateLayer` with the layer's size ([Absolum](../../dm/games/0100A83022A22000/README.md), [`vi::CreateLayer` with the layer's size](#vicreatelayer-with-the-layers-size)).
+
+### SDK 4's `friends::GetBlockedUserList` without a `Uid`
+
+- **Symptom:** abort in `sm::Initialize` under `nn::friends::GetBlockedUserList` after the opening movie.
+- **Cause:** SDK 4's overload without the `Uid` (`EPiPNS_7account23NetworkServiceAccountIdEii`), which the host did not take over.
+- **Fix:** it reports an empty list with success: the game turns a failure into an error for the error applet (`main+0x8ff9f0`). The overload with a `Uid` keeps reporting a failure, which [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) takes as it is ([Account, friends, play data and Nintendo Account calls](#account-friends-play-data-and-nintendo-account-calls)).
+- **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (SDK 4.5.0, the oldest so far; one boot).
+
+### SDK 20's `friends::GetPlayHistoryRegistrationKey` without a `Uid`
+
+- **Symptom:** an `nn::diag` abort with Result 0xe15 in `friends::detail::ipc::Initialize` (`sdk+0x3b45a8`), first thing in `nnMain`, after `[RED] sf: the game connects to service friend:u itself`.
+- **Cause:** the form without a `Uid` (`GetPlayHistoryRegistrationKey(PlayHistoryRegistrationKey*, bool)`) was not taken over, and the SDK's own opens the friends service.
+- **Fix:** taken over as the `Uid` form is: the key is unavailable (`hle_friends.c`). Both return `RES_FAIL` without writing the output; the host has no friends service. The hook is bound to the SDK symbol, with no title or build gate.
+- **Check:** `t_friends` resolves both overloads by their registered names and checks the failure result and the untouched output for both local flags, including guest bool arguments with upper bits set.
+- **Found on:** Super Nintendo Entertainment System – Nintendo Classics (`01008D300C50C000`, 6.0.0, SDK 20.5.21, `main+0xc608`; its profile is not in this repository). [PR #2162](https://github.com/seedds/nxnative/pull/2162) reports the original abort and a Mac boot past it with separate mission-events and profile changes; this hook does not add those changes.
+
+### SDK 6's `account::OpenPreselectedUser` returns a Result
+
+- **Symptom:** the first loading screen never ends; `DM_FS=1` shows `save:/system` "not found" and no `fs mount save`.
+- **Cause:** in SDK 6 `account::OpenPreselectedUser` returns a Result, and the game skips its save mount when it is not 0 (`main+0x53b7e0`). The host's hook returned void and left the handle pointer in w0.
+- **Fix:** the hook returns 0 now; SDK 7 and later callers ignore it.
+- **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) (SDK 6.5.0).
+
+### Friends presence is accepted offline
+
+- **Symptom:** the loading screen stays at 22% for ever while the music plays (Twelve Minutes). No red line, no crash. `DM_FS=1` shows `level0` and the FMOD master bank read, then no other scene and no save mount; `DM_HLECOUNT` shows `account::TryOpenPreselectedUser`, `GetUserId`, `GetNickname` and `friends::UserPresence::Initialize` once each, and `fs::MountSaveData` never.
+- **Cause:** the host's `UserPresence::Initialize` returned `RES_FAIL` like the other friends calls. The game's start-up takes the failure as fatal and stops before it mounts its save, so the loading screen waits for a scene that is never asked for. A presence is the game's own object until the friends service publishes it, so failing to set one up is not what an offline console reports.
+- **Fix:** `UserPresence::Initialize`, `SetDescription` and `Commit` succeed and publish nothing (`hle_friends.c`). The calls that need the service (friend lists, notification queue, online play sessions, invitations) still fail.
+- **Check:** `make -C dm/host/tests GAME=<id> run` runs `t_friends`.
+- **Found on:** Twelve Minutes (`0100CD701434C000`, Unity 2019.4.31f1 IL2CPP, SDK 12.3.7; seedds/nxnative#217), which has no profile in this repository; Core Keeper is reported to abort on the same failure.
+
+## File system and save data
+
+### Directory handle allocation failure
+
+- **Symptom:** the host crashes in `h_fs_OpenDirectory` when its folder-backed directory handle allocation fails.
+- **Cause:** `opendir` succeeded, but the following `calloc` of `dirh_t` was dereferenced without a null check. Returning early without cleanup would also leak the already-open `DIR`.
+- **Fix:** close the directory on allocation failure, preserve `errno` across cleanup, and return the existing filesystem failure through `err_res` before publishing a handle. The caller's output stays untouched, as on the other failed-open paths. `t_fs_directory.c` injects allocation failure in the real handler, checks the descriptor is closed and the output unchanged, then exercises successful open, count, read and close.
+- **Found on:** the [GCC audit in issue #313](https://github.com/seedds/nxnative/issues/313#issuecomment-6523656102), reproduced with a synthetic directory and allocation fault injection; no game-specific failure was reported.
+
+### The SDK's own `fs::IsMounted` reads an empty mount table
+
+- **Symptom:** IL2CPP "Could not open …/global-metadata.dat" (then a crash in its logger).
+- **Cause:** IL2CPP checks `nn::fs::IsMounted("rom")` before opening; the SDK's own `IsMounted` reads a mount table the host never fills.
+- **Fix:** answer from the host's mount table (`hle_fs.c`).
+- **Note:** the C library's path checks read the same empty table through `IsPathMounted` ([C library path checks ask the file system's limits](#c-library-path-checks-ask-the-file-systems-limits)).
+
+### A mount in the SDK's own table stays until the SDK releases it
+
+- **Symptom:** `game called nn::diag abort: Result 0x7802` (`MountNameAlreadyExists`) when a game mounts a RAM disk under a name it has just unmounted.
+- **Cause:** the host's mount table is permanent and `nn::fs::Unmount` did nothing. `nn::fs::MountRamDisk` has no host version, so it runs in `sdk` and registers in the SDK's own table, and the no-op left that entry there while the game freed the disk's buffer.
+- **Fix:** `h_fs_Unmount` leaves a host mount alone and sends any other name to the SDK: its `IsMounted`, then its `Unmount` if it holds the name (the SDK's `Unmount` aborts on a name it does not hold). `guest_sym` gives the module's own definitions, not the host's take-overs. A name in neither table stays a no-op. `t_fs.c` covers each case.
+- **Note:** this makes such a mount releasable, not usable. The host's file calls and `IsMounted` answer from the host's table only, so a file path on a RAM disk is "path not found". A game that needs the files back would need those calls routed to the SDK as well; none is known.
+- **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) ([GitHub issue #1012](https://github.com/seedds/nxnative/issues/1012)).
+
+### File handles with low bits set, and backslash paths
+
+- **Symptom:** a 10-byte read of the wrong RomFS file, then a null pointer at boot; files named `rom:\StartupUI.pak` are not found.
+- **Cause:** on Horizon a `FileHandle` is a pointer to the SDK's `FileAccessor`, a heap object, so its low bits are clear, and a game's file device may mask them off (`handle & ~7`) before `ReadFile`. The host's RomFS-image handle kept the entry index in its low bits, so entry 7 was read as entry 0. Separately, Horizon's file system accessor turns every backslash in a path into a slash before it normalizes the path (`FileSystemAccessor::SetUpPath`, on every mount except the PC host's); the host treated a backslash as part of a name.
+- **Fix:** the guest gets the host's handle shifted left by 4, 16-byte aligned like an AArch64 heap block (`FH_OUT` / `FH_IN`). Each guest path resolver (`img_path`, `host_path_ex`, `set_guest_name`, `dir_snapshot`) turns backslashes into slashes first, so overlays, `..` and guest names see the same path (`hle_fs.c`; `dm/host/tests/t_fs.c`).
+- **Found on:** Metroid Prime 4: Beyond (SDK 19; bring-up in [issue #229](https://github.com/seedds/nxnative/issues/229), from [PR #513](https://github.com/seedds/nxnative/pull/513)); not in the games table yet.
+
+### An unhooked `fs::ReadFile` overload falls through to the SDK's own
+
+- **Symptom:** a fault inside `sdk` at boot, right after the save data is mounted: `ldr w8, [x0, #0x24]` with `x0` holding a host file handle (SD GUNDAM G GENERATION CROSS RAYS: `sdk+0x62a78`, `x0 = 0x4000000000000390`), while `GetFileSize` on the same handle answered just before.
+- **Cause:** the game imports `nn::fs::ReadFile(FileHandle, s64, void*, size_t, const ReadOption&)`, the overload with read options and no bytes-read output, which the host did not hook, so the call bound to the SDK's own. That one reads the handle as a `FileAccessor*`, and the host's handle is an image-entry id ([as above](#file-handles-with-low-bits-set-and-backslash-paths)). The general case: [SDK calls that open a system service through sm](#sdk-calls-that-open-a-system-service-through-sm); the import list finds such overloads beforehand ([Listing a game's unhooked imports before they are met](#listing-a-games-unhooked-imports-before-they-are-met)).
+- **Fix:** a hook with the contract of the overload without read options (`h_fs_ReadFileExactOpt` calls `h_fs_ReadFileExact`): the options are ignored and a short read is a failure, as on Horizon, since the caller has no byte count to see it by (`hle_fs.c`; `dm/host/tests/t_fs.c`).
+- **Found on:** SD GUNDAM G GENERATION CROSS RAYS (`010055700CEA8000`, SDK 9.4.1, from [PR #947](https://github.com/seedds/nxnative/pull/947)): the fault was all that stood between the boot and its frame loop; not in the games table yet.
+
+### C library path checks ask the file system's limits
+
+- **Symptom:** Addressables never start (no `StreamingAssets/aa/settings.json` in the `DM_FS=1` output at all), then a null asset crash (`main+0x31100ec`).
+- **Cause:** Unity 2022's C# file API reaches the SDK's C library, not `nn::fs`: `File.Exists` → `SystemNative_Stat` → `stat` = `open` + `fstat` + `close` (`sdk+0x948b0`). nnmusl's path check (`sdk+0x904e0`, then the converter `sdk+0x8ef50`) asks `nn::fs::IsPathMounted`, `GetPathLengthMax`, `GetUtf16PathLengthMax`, `GetEntryNameLengthMax` and `GetUtf16EntryNameLengthMax` before it calls `nn::fs::GetEntryType` / `OpenFile`, and the SDK's own versions read the empty mount table (`IsPathMounted` false; the next one aborted with Result 0x35f202).
+- **Fix:** the host answers them from its mount table, with Horizon's 0x300-byte limits and no UTF-16 limit (`hle_fs.c`). The path .NET builds is `/rom:/…`; nnmusl's converter turns it back into `rom:/…`.
+- **Found on:** [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) (1.0.0.2, SDK 17.5.3, Unity 2022.3 IL2CPP).
+- **Note:** armyja's fork (GitHub issue #18) patched the managed stat wrappers by address instead; these hooks need no per-build table.
+
+### Paths with `.` and `..` components
+
+- **Symptom:** an Atk task aborts in a `switch` default (`UnexpectedDefaultImpl`, then `AbortImpl`) while a stream sound loads.
+- **Cause:** the stream path was `rom:/system/snd/../../sounds/streams/…`, and the host answered "not found" for any `..` component. Horizon's path normalizer resolves `.` and `..` lexically and fails only above the mount root.
+- **Fix:** `host_path_ex` now does the same (`norm_rest` in `hle_fs.c`).
+- **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md) (`main+0x1225a8c`).
+
+### RomFS lookups on large directories
+
+- **Symptom:** a long black screen at boot with nothing in the log (Engage: about 17 s on the Mac, 32 s on an iPhone); sampling the process (`sample <pid> 3`) shows `getxattr` under `path_component` at the top of stack.
+- **Cause:** the game is walking RomFS, and every path component scanned its whole parent directory. That scan maps the game's case-sensitive names onto APFS, so it calls `getxattr` on each entry, and Engage has directories of 38,000 files. The rest of the time was the listing itself: `ReadDirectory` called `stat`, `getxattr` and a failing `fopen("<file>.holes")` for every entry.
+- **Fix:** read-only mounts now use a per-directory name index built at the first lookup (`dir_index_get` in `hle_fs.c`), which also speeds up every file Wwise opens during play. In listings, now only `.dm-case-*` names (the only ones that carry the xattr) read it, directories take their type from `d_type`, and files use `fstatat` / `openat` relative to the directory.
+- **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md): with the name index the first frame came at 5.7 s on the Mac; with the listing fix too it comes at 1.8 s on the Mac (9.9 s → expected about 3 s on an iPhone), and the opening movie starts at 7 s instead of 49 s.
+
+### ReadFile into write-protected texture pool pages
+
+- **Symptom:** `[RED] fs ReadFile into … failed at +0 (EFAULT): VM region … protection 1`, now and then.
+- **Cause:** the destination was texture pool memory, which the dirty-page tracker write-protects after each upload (`nvn_dirty.c`). `ReadFile` lifts the protection first (`dm_guest_write_prepare`), but the graphics layer can protect the pages again before `pread` writes them, and a system call gets EFAULT where a plain write would fault into the tracker's handler; at 60 fps uploads come twice as often.
+- **Fix:** on EFAULT the host now prepares the rest of the buffer again (unprotect, mark dirty, so the texture is uploaded again) and reads on, up to eight times (`h_fs_ReadFile`; the first case is logged, `[fs] ReadFile … prepared again`).
+- **Found on:** [Monster Train 2](../../dm/games/010051701FB46000/README.md) at 60 fps: two runs in three as the route map loads, never at 30 fps.
+- **Check:** four runs at 60 fps: one retry, no failed read.
+
+### File-not-found noise from optional paths
+
+- **Symptom:** `fs … not found` lines with `DM_FS=1`.
+- **Cause:** games probe many optional paths (debug parameters, other-language voice files).
+- **Note:** only a missing file followed by a failure matters.
+- **Found on:** every game (general).
+
+### Directory, file data cache and save-thumbnail calls
+
+- **Symptom:** a missing `fs::DeleteDirectory`; undefined `nn::fs::` / `nn::account::` imports with no hook, found from the import list ([Listing a game's unhooked imports before they are met](#listing-a-games-unhooked-imports-before-they-are-met)) before they were met.
+- **Fix:** hooked: `fs::DeleteDirectory` (an empty directory), `fs::CleanDirectoryRecursively`, `fs::RenameDirectory` (done as `RenameFile`); `fs::EnableGlobalFileDataCache`, `fs::DisableGlobalFileDataCache`, `fs::EnableIndividualFileDataCache` / `DisableIndividualFileDataCache`; `account::StoreSaveDataThumbnailImage` / `DeleteSaveDataThumbnailImage` (nothing kept) (`hle_fs.c`, `hle_account.c`).
+- **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md) (SDK 11: `fs::DeleteDirectory` was missing); [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11: `CleanDirectoryRecursively`, `EnableGlobalFileDataCache`); [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (SDK 7.3.2: `DisableGlobalFileDataCache`); [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1: `RenameDirectory`, the thumbnail calls), [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (SDK 11.4.3: the individual file data cache).
+
+### `fs::Commit` with a list of mounts
+
+- **Symptom:** the SDK's own code opened fsp-srv and aborted, leaving the save writes uncommitted.
+- **Cause:** `fs::Commit(const char* const*, int)`, the mount-list overload, had no hook.
+- **Fix:** the host commits the list as one transaction when every name is the same host save; cache and temporary storage in the list are skipped (their writes are already on disk, as for the single-name `Commit`), and a list of two separate saves is refused without committing either.
+- **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (PR #25).
+- **Note:** SDK 11's `fs::CommitSaveData(mount)` is the older name of `fs::Commit` ([Older SDK names for the same calls](#older-sdk-names-for-the-same-calls)); `fs::Commit` with a `CommitOption` is under [Device save data on the account save's directory](#device-save-data-on-the-account-saves-directory).
+
+### Save-write failures stay with their backing transaction
+
+- **Symptom:** a failed write in one independent save can make another save's next `Commit` fail and discard its successful changes; the damaged save may then commit its truncated working file.
+- **Cause:** the host used one process-wide failure marker, consumed by whichever save committed first.
+- **Fix:** each canonical backing save owns its failure state. Open file handles retain that transaction identity, aliases share it, and each commit waits for in-flight writes or size changes to its backing save before consuming or restoring its failure marker (`hle_fs.c`). Concurrent first writes initialize the shared failure-injection settings with `pthread_once`.
+- **Check:** `t_fs_commit_list` injects write failures after truncation in either of two independent saves, verifies that the other save commits its changes, and checks failure propagation through aliases, rename failure handling, and a failed recovery clone. It blocks writes and size changes through an alias while another save commits, then verifies that both Commit ABIs wait for the affected I/O and refuse its failure. `make -C dm/host/tests GAME=<title ID> fs-tsan` also checks concurrent first writes and failed file I/O concurrent with mounting another alias.
+- **Found on:** the [two-save host regression](../../dm/host/tests/t_fs_commit_list.c). [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) uses independent device and account saves.
+
+### A save folder that cannot clone directories
+
+- **Symptom:** `[RED] save transaction: cloning the work directory failed (…, errno=45)` when the save folder (`DM_SAVE`) is on an external drive, then a read-only save mount and every save write failing (South Park: `profile.sys`); now the line reads `the save folder's filesystem cannot clone directories (save transactions need APFS …)`.
+- **Cause:** a save transaction clones the committed folder into its work folder with `clonefile` and publishes a commit with `renamex_np(RENAME_SWAP)`. Both need APFS: on HFS+ and exFAT disk images both fail with `ENOTSUP` (45), and neither format advertises `VOL_CAP_INT_CLONE` or `VOL_CAP_INT_RENAME_SWAP`, so copying the files instead of cloning them would still leave no atomic commit. The host already failed safely (the committed save mounted read-only, the iOS front end told); the line did not say why. The apps' own save folders are on APFS (the Mac app's `~/Library/Application Support/nxnative/<title ID>/save`, the iOS app's `Documents/save`); only a `DM_SAVE` set by hand or a development run's work folder can be elsewhere.
+- **Fix:** `hle_fs.c` names the cause when `clonefile` returns `ENOTSUP`: set `DM_SAVE` to a folder on an APFS volume (the RomFS and shader libraries may stay on the other drive). Recursive deletes (`rm_tree`, `CleanDirectoryRecursively`) now take each entry's type from `lstat`, not `d_type` (which a filesystem may report as unknown), unlink a symlink without entering it, and refuse a symlink given as the tree itself. Both stop at the first entry that fails and return its error, or the directory read's (`dir_next` tells a read error from the end), and `rm_tree` calls `rmdir` only once every entry is gone: before, a failed child was followed by the other entries and an `rmdir` whose `ENOTEMPTY` replaced the child's `errno`, and a read error ended the listing as if it were complete; a commit whose leftover `.new` cannot be cleared is refused with its own red line instead of failing in the clone.
+- **Check:** `dm/host/tests/t_fs.c` section 8 makes `clonefile` fail with `ENOTSUP` (read-only mount, one front-end notice, committed save unchanged, writable again once cloning works) and deletes save folders holding a symlink to a folder outside the save (the target keeps its files).
+- **Found on:** South Park: The Fractured But Whole 1.05, whose port is [PR #662](https://github.com/seedds/nxnative/pull/662) (not yet in the games table): a development Mac run with its save folder on a Journaled HFS+ external drive.
+
+### Saves that look deleted after an update or a forced restart (Android, open)
+
+- **Symptom:** Android: after an app update every game starts with no save (Forgejo #428, Donkey Kong Bananza and others, v0.3.43), or after the game hung on a load and the phone was forced off, the game no longer sees its save, also after the player copied a backup into `Android/data/<app>/files/saves` by hand (#451, Ocarina of Time). Neither report has a log.
+- **Cause:** open. No path changed between v0.3.42 and v0.3.43 (`AppStorage`, `Users`, `hle_fs.c`, the application ID), and the in-app update keeps the app's storage. Two host and launcher paths could each produce the symptom: (1) a commit cloned the work folder into `<save>.new` and swapped it in without `fsync`, so a power loss or forced restart after the swap could leave files of the right names and sizes with their data never written (zeros or nothing): the game then reads no save; (2) when the save folder was there but the app could not write it (made or replaced outside the app, as in #506), `GameActivity.saveDir` silently played an empty folder of its own (`files/save/<id>`), so the real save looked deleted; its only trace was the log's `save folder … unusable (…), using the app's private folder`. A swap journal left part way (`<save>.pend1` / `.pend2`) also lost its `.new`: the failed commit and the next mount removed it, leaving the save half swapped.
+- **Fix:** `hle_fs.c` fsyncs every file and folder of `.new` before the swap and the save's folder after it (a failed `fsync` refuses the commit); a commit or mount with a journal left keeps `.new` (the commit first runs the recovery and refuses while the journal stays; the mount goes read-only). The launcher stops the start of a save folder it cannot list or write with a sentence naming it (`GameFile.saveLocked`), instead of playing another folder. An uninstall (it deletes `Android/data/<app>` unless the player keeps the data) is not ruled out for #428.
+- **Check:** `dm/host/tests/t_fs.c` section 10 (an injected `fsync` failure, a journal left at commit and at mount); `test_android_saf.py` (`GameFile.saveLocked`). To prove a case: the game's log line `[nxlaunch] save: <path> (<how>)` with any note after it, and `ls -la` of `files/saves/` (owners, sizes, `.new`, `.pend1`, `.pend2`).
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) (#428) and [Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (#451).
+
+### New save folders on Android shared storage
+
+- **Symptom:** Android, save on `/sdcard` (`/storage/emulated/0/Switch2/saves/<id>`): the first commit succeeds, then `fs mkdir name …/<id>.work/0 failed errno=95` and the game's saving icon spins forever while play goes on. Only a save that does not yet have the folder (a new game) hits it.
+- **Cause:** after `mkdir` / file creation the host clears a stale guest-name xattr (`set_guest_name`, `hle_fs.c`) and accepts only "no such attribute" as success. Android's shared storage is FUSE and keeps no `user.` attributes: `lremovexattr` answers `EOPNOTSUPP` (95), so `CreateDirectory` failed.
+- **Fix:** `plat_android.c` reports `EOPNOTSUPP` from `getxattr` / `removexattr` as `ENODATA` (`PLAT_ENOATTR`): on a filesystem with no attributes, none is present, as `plat.h` promises. Setting one still fails; FUSE `/sdcard` is case-insensitive, so two guest names differing only in case (a `.dm-case-N` alias, which needs the attribute) still cannot be created there (open; no game has needed it).
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) on Android, a new game in the play app (its save had only `config.sav`); the test seed already had the slot folder `0`.
+
+### Save data size queries
+
+- **Symptom:** SIGSEGV at address 0 in `nn::fs::GetSaveDataSizeMax`, about 13 minutes into a new game.
+- **Cause:** Unreal's save system asks before its first save; the SDK's version reads the fsp-srv object the host never made.
+- **Fix:** it reports 256 MB of data and journal, as `GetSaveDataSize` does (`hle_fs.c`). `fs::GetCacheStorageSize` and `fs::GetFreeSpaceSize` give the same answers. Also hooked: `fs::GetSaveDataSize` / `ExtendSaveData` and the one-argument `fs::MountCacheStorage`.
+- **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (`GetSaveDataSizeMax`, `GetCacheStorageSize`, `GetFreeSpaceSize`, found by the import list); [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11: `GetSaveDataSize`, `ExtendSaveData`, `MountCacheStorage`).
+
+### Cache storage and other titles' save data
+
+- **Symptom:** each aborted in `sm::Initialize` or read a null applet proxy, one per boot.
+- **Cause:** SDK 20 file system calls that reach a service.
+- **Fix:** cache storage: `OpenCacheStorageList` / `ReadCacheStorageList` report none, `CreateCacheStorage` / `MountCacheStorage` use a host folder beside the temporary storage. `fs::IsSaveDataExisting(ApplicationId, Uid)` for another title (it asks for Breath of the Wild's save: none) and `MountSaveDataReadOnly`.
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) (1.4.3, the same `sdk` build as Breath of the Wild 1.9.0).
+
+### Device save data on the account save's directory
+
+- **Symptom:** the island lives in device save data, which the host did not mount.
+- **Cause:** 3.0.3's `main` mounts no account save data; the island is in device save data (`MountDeviceSaveData`, `GetDeviceSaveDataSize`, `ExtendDeviceSaveData`).
+- **Fix:** the host gives device save data the account save's host directory and transaction (one player). A second mount name over a save already mounted now shares that mount's transaction (`mount_ex`); it used to clone the committed directory again, over the first name's pending writes. Also `fs::Commit` with a `CommitOption` (its one flag clears the restore flag) and `GetSaveDataRestoreFlag` (never restored from a backup).
+- **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (3.0.3, SDK 20.5.4).
+- **Note:** a game whose `main` imports `MountSaveData` too gets its device save as a save of its own ([Device and account save data as two saves](#device-and-account-save-data-as-two-saves)).
+
+### Device and account save data as two saves
+
+- **Symptom:** every boot asks to pick a Mii again (`DM_FS=1`: `UserSave:/userdata.dat` not found although the host save has it).
+- **Cause:** the game mounts `CommonSave` with `MountDeviceSaveData` and `UserSave` with `MountSaveData(uid)` (`main+0x8b0c84`), two saves on Horizon; the host made device save data the account save (for Animal Crossing: New Horizons, which mounts only device save data), so both names shared one directory. At boot the save manager deletes `CommonSave:/userdata.dat` (`main+0x8b1910`, through its file device's `DeleteFile`, `main+0x633afc`; a probe there with `@*x1+8` shows the name) and commits, and in the shared directory that was the account save's own file.
+- **Fix:** a game whose `main` imports `MountSaveData` too gets its device save as `<DM_SAVE>_device`, a transaction of its own (`hle_fs.c`); of the games on hand only this one imports both, so Animal Crossing's islands stay where they are.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.0, SDK 4.4.0; one boot).
+
+### More than one user, each with a save of its own
+
+- **Symptom:** a game that keeps a save per user cannot add one: its "new save file" asks the user selector for a user without a save, and the host had one user, who has one (Super Mario Bros. Wonder's save files).
+- **Cause:** the host had one fixed user (`hle_account.c` `k_uid`): every account list held it, `ShowUserSelector` returned it, every save mount went to `DM_SAVE` whatever the Uid, and `IsSaveDataExisting` said yes for every user.
+- **Fix:** the users come from the front end: `DM_USERS` (each user's Uid as 32 hex digits and its name, percent-encoded) and `DM_USER` (the preselected user). The account calls list them; `GetNickname` gives each its name; the preselected and last-opened user is `DM_USER`. `ShowUserSelector` leaves out the Uids the game's `UserSelectionSettings` lists (8 at offset 0), takes the one user left when it may skip (offset 0x80), and otherwise asks the front end (`front_user_select`: the Android launcher's picker, `UserPicker.java`); a cancel returns the console's 2124-0001, and a front end without a picker gives the preselected user, as before. The first user keeps the fixed Uid and its save, `DM_SAVE`; another user's save is `<DM_SAVE>_user_<uid>`, made by `EnsureSaveData`, and `IsSaveDataExisting` says yes for it only once made (`hle_fs.c`). With more than one user, `Unmount` frees a save's mount name (its uncommitted writes dropped, as on Horizon): the mount table was permanent, so a game that unmounts `save` and mounts it again for another user kept the first user's save under the name, and every user's save file was the first user's (the first try on Wonder). The next save mount takes the freed table entry again (unless another mounted name still shares its transaction), so a game that mounts and unmounts its save again and again does not fill the table ("mount table full"). With one user `Unmount` stays the no-op it always was: every mount names the same save, and writes not yet committed are kept, as in every earlier run. A save mounted under a name that still holds another save, with no `Unmount` between, logs a `[RED]` line. Other mounts stay permanent. Save sync (`DM_SAVE_SYNC`) covers the first user's save only. Without `DM_USERS` nothing changes: one user, `DM_NICK`. The Android launcher's Settings › Users adds, renames and removes users and picks the one games start with (`Users.java`, `UsersUi.java`).
+- **Check:** on Wonder's Switch 2 Edition the second user's save folder was made and mounted, and was the first user's until `Unmount` freed the name; with that, not yet run. The `UserSelectionSettings` layout (the 8 Uids, the skip flag at 0x80) is the console's as documented, not yet read from a game's code.
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): its save files are per user (asked for on its Switch 2 Edition).
+
+### System data stand-in for the MiiModel archive
+
+- **Symptom:** abort in `fs::detail::GetFileSystemProxyServiceObject` under `fs::QueryMountSystemDataCacheSize` (`main+0x8f23bc`).
+- **Cause:** the game mounts system data 0100000000000802, MiiModel, as `MiiResource:` and reads `NXTexture{Low,Mid}{Linear,SRGB}.dat` and `Shape{Mid,High}.dat` whole; the SDK's Mii rendering is linked into `main` (`main+0x8f1400`–`+0x8fc000`).
+- **Fix:** firmware content is not the host's to ship, so the host writes a stand-in of the same layout with every part blank (`dm_mii_standin` in `hle_mii.c`, mounted by `hle_fs.c` `MountSystemData`; any other system data answers "target not found"). Heads build and draw nothing; bodies and favourite colours show.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.0, SDK 4.4.0; one boot).
+- **Note:** the layout as the code reads it: texture file +0xc the largest decompressed size of each of 11 part kinds, +0x38 their alignments, from +0x64 one 0x1c-byte entry per part (offset, size, stored size, 4 zlib parameters, then width, height, format, mips); shape file +0xc / +0x3c the same for 12 kinds, from +0x6c one 0x58-byte entry per part (offset, size, stored size, parameters, five vertex attribute offsets and sizes, index offset and byte size, bounding box), then hair (132 × 0x48, +0x12704) and faceline (12 × 0x24, +0x14c24) transforms. A texture of size 0 is skipped (`main+0x8faaf4`), but a game may still ask for its texture, so every texture entry points at one blank 8x4 texture ([A Mii part the stand-in leaves out](#a-mii-part-the-stand-in-leaves-out); Mario Kart 8 Deluxe has not been run with it); shapes cannot all be absent, because the faceline is drawn without a check (a null buffer read at `main+0xa690d0` under `main+0x8286c4`), so every shape entry points at one shared mesh of one vertex and the triangle (0, 0, 0), 32 bytes of zeros in a stored zlib block. The largest sizes must not be 0: they size the model's memory pool (`main+0x8f2e6c`), whose alignment is the first one. The Mii database itself: [Mii database answered by the host](#mii-database-answered-by-the-host).
+
+### The Switch 2's Mii model archive
+
+- **Symptom:** at boot `[RED] fs mount system data MiiResource: the host has no 0400000000000849`; the game goes on, and minutes later, where it first builds a Mii model, a guest crash reading address 0xc (`[dm] CRASH sig=11 addr=0xc`). Nintendo Switch Sports Resort: `pc=main+0x1cdcfb4`, `lr=main+0x1cd2e68`, 3.7 minutes into a session, in two-player Avioneta.
+- **Cause:** the Switch 2's Mii model data is system data 0400000000000849, which the game mounts as `MiiResource:`; the host served only the Switch's MiiModel, 0100000000000802. With the mount refused the game's Mii resource kept null file pointers, and the function at `main+0x1cd2e30`, which sizes a model's memory with `nn::mii::detail::CalculateSizeAndAlignment`, read the texture file's largest part size (`+0xc` of the file, `main+0x1cdcfb0`) through the null one.
+- **Fix:** the same stand-in serves both archives from one directory ([System data stand-in for the MiiModel archive](#system-data-stand-in-for-the-miimodel-archive)) and holds the Switch 2's texture sets too (`OunceTexture{Low,Mid,High}{Linear,SRGB}.dat`). The files have the Switch's layout: the game's accessors (`main+0x1cdcd80`–`+0x1cdd0c4`) read 11 texture part kinds from +0x64 in 0x1c-byte entries with the same section offsets, 12 shape kinds from +0x6c in 0x58-byte entries, the hair transforms at +0x12704 and the facelines at +0x14c24, and skip a texture entry of size 0 (`main+0x1cdead0`), which the stand-in no longer has ([A Mii part the stand-in leaves out](#a-mii-part-the-stand-in-leaves-out)). Mii heads build and draw nothing, as with the Switch's stand-in.
+- **Check:** `t_mii_sysdata` (host tests): both archives mount from the one stand-in directory, every file the game names reads in that layout, another archive is still "target not found". Switch Sports Resort on the Mac: the mount succeeds at boot, and the menus, table tennis and one-player Avioneta play as before. The crash itself needs two players, which a scripted run cannot be: a player's 11-minute session with the stand-in (2026-11-12), two-player Avioneta among it, did not crash.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
+
+### A Mii part the stand-in leaves out
+
+- **Symptom:** a crash in an NVN texture call with a null texture where the game builds or draws a Mii model: `[dm] CRASH sig=11 addr=0xc pc=h_nvnTextureGetFlags+0`, `x0=0`. Nintendo Switch Sports Resort: two-player skate, on leaving the practice zone (a player's session, 2026-11-12, 193 s in), guest backtrace `main+0x49c58 main+0x3fbc9b0 main+0x3fbbb24 main+0x3fbb474`.
+- **Cause:** the [Mii model stand-in](#system-data-stand-in-for-the-miimodel-archive) left every texture part out (size 0). The Mii code skips such a part when it builds a model (`main+0x1cdead0` in `CharModel` initialization, `main+0x1cd33e0`), but its texture getter (`main+0x1cd5490`) answers for a part by the model's create flags alone: texture 1 (the part of kind 0 that `GetHairType` picks, held at the model +0x150) exists whenever the normal or the hat flag was given. The firmware's files have every part, so on a console the getter's answer always holds a texture. Switch Sports Resort sets up a renderer for its Mii models there (`main+0x3fbb420` → `main+0x3fbc8d0`), which takes textures 0 and 1 and registers each in its texture pool (`main+0x49b30`: `nvnTexturePoolRegisterTexture`, then `nvnTextureGetFlags`); texture 1's holder was the empty one (`main+0x1cdd0f0`), so both calls got a null texture and the second read its flags through it.
+- **Fix:** in `hle_mii.c`, for every game that uses the stand-in: every texture part is one shared blank texture, as the firmware's files have one for every part: 8x4 texels of format index 0 (nn::gfx `R8_Unorm`, the table at `main+0x42d2688`), one level, optimal tiling, 0x20 zero bytes stored as one zlib block (the mesh's), which the reader inflates into the texture's own storage (`main+0x1cdcbe8`, 512 bytes on NVN). Mii heads still draw nothing.
+- **Check:** `t_mii_sysdata` (host tests): every part of every texture file has a texture whose data inflates to its size, no more than its texels (one check fails without the change). The crash itself needs a second player, which a scripted run cannot be: a player's 11-minute session with the blank texture (2026-11-12), two-player skate among it (the practice zone, then leaving it), did not crash ([the game note](../../dm/games/04008E001F098000/README.md#miis)).
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
+
+### Save-sync metadata errors close the temporary file
+
+- **Symptom:** a failed write of `<DM_SAVE>.sync.tmp` leaks its stream, and the diagnostic can report a cleanup error instead of the write error.
+- **Cause:** `write_base` short-circuited `fprintf`, `fclose` and `rename` in one condition. A failed write skipped the close; `unlink` could then replace `errno` before logging.
+- **Fix:** always close an opened stream, preserve the first write/close/rename error, and rename the temporary file only after both writing and closing succeed. Cleanup leaves the previous sync metadata in place.
+- **Found on:** static analysis reported in [issue #313](https://github.com/seedds/nxnative/issues/313#issuecomment-6543080671); reproduced without game files.
+- **Check:** `t_save_sync_metadata` injects open, write, close and rename failures into the production writer, including simultaneous write/close failures and cleanup changing `errno`. It checks descriptor closure, preservation of existing metadata, diagnostics and a successful replacement. No cloud service or gameplay validation is claimed.
+
+## Add-on content
+
+### Add-on content from `DM_AOC_DIR`
+
+- **Symptom:** DLC the player owns is not unlocked.
+- **Fix:** the host reports add-on content from `DM_AOC_DIR`, one numbered folder per DLC index (title ID − base − 0x1000) holding that DLC's RomFS. `build_ipa_from_nsp.py` packs the dump's DLC (`dlc/<DLC title ID>/<n>/romfs`) into one image per index, `build_ipa.sh` copies them to `<App>/aoc/`, and the app sets `DM_AOC_DIR`. `aoc::CountAddOnContent` / `ListAddOnContent` report those indices (`hle_misc.c`), and `fs::MountAddOnContent` mounts the folder read-only (`hle_fs.c`). D2R keeps its fixed `{1}` without `DM_AOC_DIR`; `DM_AOC_OWNED=0` reports none.
+- **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md): its two DLC packages each hold one empty marker file (`e0`, `h0`), and the content is already in update 2.0.0. `DLCManager.RefreshHasList` marks a content owned when its mount succeeded (probe `main+0x29f3c88`).
+
+### Owned add-on content lists beyond 64 entries
+
+- **Symptom:** some owned DLC is missing, and `aoc: reporting` stops at 64 add-on contents.
+- **Cause:** `hle_misc.c` stored only 64 indices and stopped reading `DM_AOC_DIR` when that array filled, before sorting. The omitted indices depended on directory order; its 256-byte log buffer also truncated longer lists.
+- **Fix:** the shared array holds 2000 indices, covering the scanner's existing accepted range (1..2000), and a static buffer holds the complete index log without increasing guest-stack use. Folder and `.img` discovery, sorting, deduplication, pagination and `DM_AOC_OWNED=0` retain their behavior. This applies to every game using the add-on content hooks.
+- **Open:** the existing 1..2000 acceptance range is retained; it is not established here as Horizon's full legal range. More than 2000 accepted folder/image entries can still fill the array before deduplication, even when their unique indices fit.
+- **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (13.0.5, 99 DLC licences; PR #441).
+
+### Add-on content mount cache sized as RomFS working memory
+
+- **Symptom:** SIGSEGV in `crypto::detail::CbcModeAes128Helper::DecryptBlocks` with a null destination (`main+0x8737e8`, right after `aoc:` is mounted).
+- **Cause:** the add-on content (0100152000023001: `contents.dat` and `version.txt`, the courses are in the update) is decrypted in `AocHeap`, a 0x3130-byte heap that also holds the mount cache. The host answered `QueryMountAddOnContentCacheSize` with 4 KB, and the 0x1400-byte decryption buffer then did not fit.
+- **Fix:** on Horizon the cache is the RomFS's file table as `RomFsFileSystem::GetRequiredWorkingMemorySize` sizes it: both hash tables (4 bytes a bucket, the builder's bucket count) and all directory and file entries (0x18 / 0x20 bytes plus the name, padded to 4), 0x88 bytes for these two files. The host computes that from the folder it mounts (`romfs_work_size` in `hle_fs.c`); `rom` keeps its minimum answer, which is too small rather than too large.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.0, SDK 4.4.0; one boot).
+
+### Add-on content queries on a small guest stack
+
+- **Symptom:** SIGBUS in `__vfprintf` under `aoc_load`, from `h_aoc_Count` (a store to `0x…67ff0`, right below a page of the guest thread's stack).
+- **Cause:** the first add-on content query lists `DM_AOC_DIR` and logs, a few KB of stack, and the game asks from a thread with little left.
+- **Fix:** `aoc::CountAddOnContent` and `ListAddOnContent` run on the big host stack (`HLE_FORCE_BIG`, `hle_misc.c`).
+- **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md) (SDK 6.4.0; one boot).
+
+### An add-on content mount name used again after Unmount
+
+- **Symptom:** the game shows the add-on content version error (`game asks to show an error: add-on content version mismatch`) after its title screen, with every add-on in `DM_AOC_DIR`; with `DM_FS=1` the first add-on's file opens and the second's is not found under the same mount name (Pokémon Friends: `AVCtitle:/AocVersion/AocVersion_DLC01.json` opens, `AocVersion_DLC02.json` is `fs stat not found`).
+- **Cause:** the game checks each add-on in turn under one mount name: `MountAddOnContent("AVCtitle", index)`, read its version file, `Unmount`. On Horizon Unmount releases the name. The host's mount table is permanent and its Unmount a no-op, and a mount under a name in use answers success with the old target, so the second add-on's mount still showed the first one's files.
+- **Fix:** an add-on content mount releases its name at Unmount (`hle_fs.c` `aoc_release`): the entry is marked released, which no name lookup matches (`mnt_is`). The entry and its image stay, as an open image file names its entry by index, and a later mount of the same image under any name takes that entry back (`mount_aoc`), so cycling through the add-ons does not grow the table. Save, RomFS and other mounts keep the permanent table.
+- **Found on:** Pokémon Friends (`010008C01E742000`, update 1.1.5, two add-ons; no profile in the repository yet). Its expected versions are one string, `"3"`, compared for equality (`AocVersionCheker.Check`), which both add-ons hold.
+
+## Input
+
+### Controller disconnect between style and player lookup
+
+- **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).
+- **Cause:** a style check looked up the connected player, then input or vibration routing looked it up again. A disconnect between the reads made the second result -1, used in `1u << player`.
+- **Fix:** look up the player once and derive the style from that same result before constructing the player mask.
+- **Found on:** clang static analysis ([issue #424](https://github.com/seedds/nxnative/issues/424)); no gameplay failure reported.
+
+### Gamepad axes batched to the display frame on Android
+
+- **Symptom:** (Android) a controller "lags sometimes": sticks, triggers and a DualShock's d-pad answer later than its buttons, more so while the launcher's main thread is busy.
+- **Cause:** Android batches joystick motion events (`ACTION_MOVE` of `SOURCE_JOYSTICK`: sticks, triggers, hat axes) and hands them to the window at its next frame (Choreographer's input callback), so an axis change reached `onGenericMotionEvent` and the host (`Native.axes` → `dm_pad_set_player`) up to one display refresh late, later when the main thread was busy at that frame. Key events (buttons) are not batched. The host itself adds nothing: the state is published as it arrives and the game reads the newest at its own input read (`hle_hid.c` `fill`; press edges latched until that read), as Horizon's HID hands over its newest sample. The rest of the latency is the game's: it reads input once a frame, so a long frame delays its next read by the frame's length.
+- **Fix:** (2026-11-10, not yet phone-checked) `GameActivity.onWindowFocusChanged` asks the window's root for unbuffered dispatch of the joystick source class (`View.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK)`, API 30), so each axis event reaches the host as it arrives.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md#found-on-this-game) with a Bluetooth Sony controller ("Wireless Controller") on the Honor PNM-N49: the log shows the input path working; the lag the player felt follows the long frames and the interval-2 frames.
+
+### History reads fill every requested entry
+
+- **Symptom:** buttons and menus work, the sticks do nothing in play (Super Mario Odyssey: its first hint, "Look Around", waited forever); an `nn::diag` abort with Result 0x2aca in the first frames of `nnMain` (Hollow Knight: Silksong, Unity 6000.0.50f1: `bt: sdk+0x514580 main+0x1296c64 …`).
+- **Cause:** games read whole histories and ignore the returned count. Odyssey reads all 16 entries of `GetNpadStates`; the host filled only the newest. It polls every controller slot each frame, which moves the shared sampling number on by about 16, so the stick samples it combined were mostly empty, while buttons and the stick's direction bits (which menus use) still came through. Silksong's `main+0x1296c60` calls `hid::GetDebugPadStates(states, 16)` every frame, and the SDK's own reads a debug pad resource nothing initialized (module 202, hid); the host had only the single-state `GetDebugPadState`.
+- **Fix:** the host now fills every requested `GetNpadStates` entry with the current state under consecutive sampling numbers; the `GetDebugPadStates` history form answers every requested entry as not connected, newest first with consecutive sampling numbers (`hle_hid.c`). `DM_KEYS` takes `RLeft` / `RUp` / `RRight` / `RDown` for the right stick.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md); [Hollow Knight: Silksong](../../dm/games/010013C00E930000/README.md).
+- **Note:** Odyssey's six-axis history is read the same way ([Six-axis sensors](#six-axis-sensors)).
+
+### Npad style set update event
+
+- **Symptom:** the game never reads the controller (the title's "Press L+R" never sees a press; no `GetNpadState` call at all).
+- **Cause:** it waits for the event bound by `hid::BindNpadStyleSetUpdateEvent` before reading.
+- **Fix:** the host now signals it once when it is bound for a connected controller, and again when a player's controller connects or goes away.
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) (SDK 8.2.0).
+
+### No npad style before `SetSupportedNpadStyleSet`
+
+- **Symptom:** a game's heap layout differs from the console's from start-up on: Pokemon Sword's root heap objects lay 0x50 to 0xF0 bytes off where the console has them.
+- **Cause:** the hid service keeps an application's npads empty until the game has set its supported styles. The host reported a style from the start; Pokemon Sword asks for No1's style between `InitializeNpad` and `SetSupportedNpadStyleSet` (`main+0x65adb4` → `main+0x65af30`), and with a style there it made its four vibration objects about 4,300 allocations early.
+- **Fix:** `hle_hid.c` reports no style until the game sets a non-empty style set (`styles_set`); then the style events bound before fire, as on a connect (`styles_now`). A game that reads a controller's state without ever setting its styles gets them from that read on, with a `[RED]` line, so no game is left without input. `DM_HID_STYLE_EARLY=1` reports a style from the start, as before.
+- **Found on:** [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) (1.3.2).
+- **Check:** `t_hid` (no style before the set, an empty set lifts nothing, the bound events fire once, a state read lifts it).
+
+### The Handheld npad's style event and a change of operation mode
+
+- **Symptom:** after switching between handheld and docked while the game runs, the game no longer reads player 1's controller (Link's Awakening).
+- **Cause:** player 1 is on the Handheld npad in handheld mode and on No1 docked, so a change of mode changes both npads' styles. The host kept the style events of No1 to No8 only and signalled none at a mode change; the Handheld npad's event fired only at its binding, which with no style before the supported styles are set is too early for a game that binds first.
+- **Fix:** the Handheld npad's event is kept too (`style_ev_slot`), and `hle_oe.c` `oe_state_set` signals No1's and Handheld's style events on a change of operation mode (`dm_hid_opmode_changed`).
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md).
+- **Check:** `t_hid` (a change of operation mode signals No1's and Handheld's events).
+
+### A game that takes no full-key controller
+
+- **Symptom:** docked (and for players 2 to 8), the game ignores the controller and the keyboard: it opens the controller applet again and again, or waits at its title.
+- **Cause:** the hid service connects a controller only in a style the game supports (`SetSupportedNpadStyleSet`), and games test the style before anything else. The host showed every whole controller on No1 to No8 as a full-key one, a style these games never asked for: Nintendo Switch Sports Resort's lobby takes Handheld and JoyDual only, so its player check found no player 1 and it opened the controller applet every frame (upstream nxnative); Pokémon: Let's Go takes Handheld, JoyLeft, JoyRight and Palma, and docked it read nothing (upstream nxnative PR #3086).
+- **Fix:** a whole controller is shown in the supported style closest to it (`pad_style` in `hle_hid.c`): full-key when supported, else a JoyDual pair (every button, both sticks, two six-axis sensors, two vibration devices), else one Joy-Con, the right one first since it has the controller's own A / B / X / Y, then the left one; a game with none of these keeps full-key, and the Handheld npad stays Handheld. As one Joy-Con, the other half's buttons count as the ones in the same place on the shown side (`single_joy_fold`: the D-pad as A / B / X / Y on a right Joy-Con, L as R, − as +, and the other way round), and the more deflected stick is that side's stick; the state's attributes name only that half. It has one six-axis sensor (a right Joy-Con's is device 1) and one vibration device, style index 6 or 7, which drives the pad's motor on that side; a full-key handle the game got before still reaches the pair, or the shown side's motor. A change of the supported styles that changes the shown style signals the connected npads' style events and stops the rumble of the old style's motors. Six-axis handles of a set of several styles take the shown style when the set holds it.
+- **Found on:** upstream nxnative: [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md#motion-controls) (Handheld | JoyDual) and Pokémon: Let's Go, Eevee! (docked keyboard input checked there; no profile here). Not run on Android.
+- **Check:** `t_hid` (`t_joy_styles`: a JoyDual pair, a right and a left Joy-Con, their buttons, sticks, attributes, sensors and vibration handles, the style events, handheld mode and a game with none of these styles).
+
+### Six-axis sensors
+
+- **Symptom:** motion moves never happen; shaking does nothing (Super Mario Odyssey: cap throws by shaking).
+- **Cause:** the host handed out six-axis handles but reported no sensor.
+- **Fix:** it now reports one per connected controller: two for handheld or dual Joy-Cons, one otherwise, with the style, npad id and device in the handle. At rest the sensor lies flat: acceleration (0, 0, −1) G, no rotation, identity direction. Samples are 5 ms apart on the guest clock and numbered by time, so a history read returns the samples at those times. `DM_BTN_SHAKE` (`dm_input.h`: the iPhone shaken, Space on the Mac, `DM_KEYS` `Shake`) plays a side-to-side shake in whole cycles.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md): it reads all 16 history entries per sensor and ignores the count, like its npad history ([History reads fill every requested entry](#history-reads-fill-every-requested-entry)).
+- **Note:** find a game's swing detector by probing the accelerometer value it reads (`DM_PROBE=main:626248@x8+10` in Odyssey 1.4.1).
+
+### Live controller motion
+
+- **Symptom:** motion controls do nothing with a controller that has a gyroscope (Breath of the Wild: aiming with its Motion Controls option on); the six-axis sensor always lies flat.
+- **Cause:** the host's six-axis sensor had no source of motion: flat at rest, apart from the `DM_BTN_SHAKE` shake ([Six-axis sensors](#six-axis-sensors)).
+- **Fix:** a controller with a gyroscope drives its player's sensor on the Mac and iOS (`GCMotion`, `motion_apple.h` → `dm_motion_set`, `hle_hid.c`); on iOS the phone's own device motion drives player 1's while no controller supplies fresh motion (`DmGamepad.m`). The orientation is integrated from the gyro with tilt correction toward the measured gravity (`motion_fusion.h`), in `SixAxisSensorState`'s units (G, revolutions/s, revolutions). After 300 ms without a sample the source expires; without another source the sensor lies flat again. A shake still adds on top. The switches are in [development.md, How it works](../development.md#how-it-works) (Input).
+- **Source routing (resolved, review of PR #351):** sharing one integrator let phone and controller callbacks mix orientations, including with `DM_PHONE_MOTION=1`; checking only `hasRotationRate` also let zero-only controller reports suppress the phone. Each source now has its own orientation and timestamp: auto prefers fresh controller data, forced mode selects only the phone, and the Apple adapter waits for actual data before publishing. One-player games merge motion from the same controller slots as buttons. Motion settings initialize once with `pthread_once`; per-source locks also protect diagnostic timestamps. `t_hid` covers routing, expiry and concurrent startup under ThreadSanitizer; `t_motion_apple` covers activation, zero-only reports and detachment.
+- **Upright initialization (resolved, review of PR #351):** the heading reference was parallel to gravity when the phone started upright, so projection produced a zero vector and silently left the orientation flat. A nonparallel reference now primes the orientation on the first sample; `t_motion` covers all six axis-aligned starting poses.
+- **Back from the background (iOS):** iOS turns a manual-activation controller's sensors (DualSense, DualShock 4) off while the app is in the background and leaves them off, so the gyro stayed dead until the controller reconnected (reported by MacNativeGames on the iPad). Becoming active again sets `sensorsActive` once more for every attached controller (`dm_motion_rearm`, `front_ios.m`); not tested on a device here.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0): motion aiming on a Mac with a DualSense. The iOS paths have not been tested on a device.
+- **Note:** history entries repeat the newest sample; yaw drifts as on the console, with no recenter. The console's own sensor still reports no states ([SDK 20 six-axis sensor and amiibo (`nfp`) calls](#sdk-20-six-axis-sensor-and-amiibo-nfp-calls)), so motion follows the controller in docked mode.
+- **Open:** [PR #286](https://github.com/seedds/nxnative/pull/286) has iPad aiming measurements and calibration controls to compare on a device before choosing shared defaults. Related reports: [#153](https://github.com/seedds/nxnative/issues/153), [#389](https://github.com/seedds/nxnative/issues/389).
+
+### Android: the phone's sensors never started
+
+- **Symptom:** gyro aiming does nothing on Android (Splatoon Raiders); the log has no `input: phone sensors on` line and no `[RED] input: no accelerometer` either.
+- **Cause:** `GameActivity.onResume` starts the sensors (`Native.motionStart`) only when the game has started, but `start()` can run after the first `onResume` (the readiness check holds it, `readinessHold`), so the one call that starts them was skipped and nothing started them later.
+- **Fix:** `onResume` records that the screen is resumed before it checks the start, and `hostSetup()` (run by `start()` and `attach()`) starts the sensors when it is, unless the game is paused. `nxhost_motion_start` does nothing when they already run.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md) on Android, with the phone's own gyroscope. Check with `DM_MOTION_LOG=1` (the log shows the sample once a second).
+- **Open:** a controller's own gyro (a DualSense or Switch Pro on the phone) still has no source on Android; only the phone's sensors reach the game.
+
+### The phone's gyro aims badly: big movements, no steady hold
+
+- **Symptom:** gyro aiming (Splatoon Raiders, issue 174) needs a large turn of the phone for a small move of the aim, and a held phone cannot keep the aim on a point: the cursor creeps up and down.
+- **Cause:** the phone's rates reached the game unchanged (1:1, as a console's, but a phone is heavy and held out in both hands), with no setting for the scale and no dead zone for the tremor and sensor noise that a held phone always has. The tilt correction also trusted the accelerometer whenever |acc| was within 0.2 G of 1 G, so the hand's own acceleration while aiming read as tilt and pulled the pitch. Open: the 1:1 scale itself is unmeasured on a phone (`DM_MOTION_LOG=1`, a 90 degree turn in a second should read 0.25 rev/s).
+- **Fix:** `motion_shape` (`motion_fusion.h`) applies a dead zone (default 0.5 degrees / s for the phone's gyro, `DM_MOTION_DEADZONE`) and a sensitivity factor for the phone's gyro (`DM_MOTION_SENS`; Game settings › Controls › **Motion sensitivity** and the in-game panel's slider, which applies at once through `Native.motionSens` / `dm_motion_sens`: 10 to 150 %, default 50 %, the phone's gyro only: a controller's gyro keeps its real turn) to every source's rate before the orientation is integrated. The tilt correction's weight falls linearly from 1 at 1 G to 0 at 0.9 and 1.1 G.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md). Phone check open.
+
+### The six-axis history repeated the newest sample
+
+- **Symptom:** motion aiming feels late and loses part of a quick turn, most in a 30 fps game; the present path is not behind (`DM_VK_PRESENT_TRACE=1`: a frame is on the screen about 11 ms after it is queued).
+- **Cause:** `six_states` filled every entry of the history a game asks for with the newest sample. A game that reads the states since its last frame (`GetSixAxisSensorStates` once a frame) got one sample a frame: at 30 fps and a 109 Hz gyroscope, one of the three or four that arrived, and the turn the others measured never reached the game.
+- **Fix:** each motion source keeps its last 64 samples with their times (`live_motion.hist`), and entry i of a read is the sample that was current i × 5 ms ago (`motion_live_hist`: the source chosen as `motion_live` chooses it; a time before the oldest kept sample gives that one). One state read is the newest sample, as before. The first read logs `hid: the game reads N six-axis states at a time`. `t_hid` checks the history. From Peanuts Native (igawa6/peanuts-native 9ae221f87ffc); not yet confirmed by play here.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) on an AYN Thor (Peanuts Native).
+
+### The phone's gyroscope reached the game five times a second (Android)
+
+- **Symptom:** aiming by the phone's gyroscope trails the hand and moves in steps while the sticks turn the camera smoothly ([issue #421](https://git.eden-emu.dev/moceure/BananaNative/issues/421) is the likely report). The log's `input: phone gyroscope:` line (10 s after the start, then once a minute) shows samples arriving about 200 ms after they were measured.
+- **Cause:** the sensor thread (`input_android.c` `motion_thread`) prepared its looper with `ALooper_prepare(0)` and added the sensor queue without a callback, which such a looper refuses (logcat: `Looper: Invalid attempt to set NULL callback but not allowed for this looper`). The queue never woke the poll, so the thread read the sensors only when its 200 ms timeout ran out, and every sample of a burst was stamped with the time it was read, so the turn between them counted as none. Measured on an AYN Thor: the sensor service had each sample within about 17 ms of its timestamp, the thread got it 202 to 205 ms after.
+- **Fix:** the looper is prepared with `ALOOPER_PREPARE_ALLOW_NON_CALLBACKS`; each gyroscope sample keeps the time the sensor measured it (the event's `CLOCK_BOOTTIME` timestamp moved onto the host clock, never in the future: `dm_motion_set_switch_at`); the sensors are asked for 200 Hz, the console's six-axis rate (was 100 Hz). From Peanuts Native (igawa6/peanuts-native 7c562dc7e526, 28ce2e68dbbc, 32e8fadf2240); not run on a device here.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) on an AYN Thor (Peanuts Native).
+
+### Android: a phone's own input device took player 1
+
+- **Symptom:** on Xiaomi and POCO phones a connected controller (a GameSir X3 Pro) does nothing in a game that reads only player 1; the log has `input: device 3 (uinput-xiaomi) is player 1` and the controller as player 2, and `hid controller applet: 1 to 1 players wanted, 2 connected`. The on-screen controls hide even with no controller connected.
+- **Cause:** the launcher gave every device that is not `InputDevice.isVirtual()` and reports a gamepad or joystick source a player when it connected, in the order of the device ids (`GameActivity.onInputDeviceAdded`), and the host gives the first device to connect player 1 (`pad_slots.h`). "uinput-xiaomi", a system device the phone makes with uinput, passes that filter and has a lower id than any controller connected later.
+- **Fix:** `PadOrder.java` ranks devices by what Android reports, never by name: the device chosen as player 1, then external devices (`InputDevice.isExternal`) with gamepad buttons and an X / Y stick, other external gamepads, built-in ones with gamepad buttons, a stick and a vendor ID, then the rest. External devices get a player when they connect, best rank first; built-in ones only from their first input (a gamepad button, or an axis past half), so a device that never sends any takes no player and does not hide the on-screen controls. A device that gets a player takes player 1 when player 1 is free or held by a worse-ranked device, through the host's `nxhost_input_device_first` (`pad_slot_first`: the two trade players). The in-game panel's **Controllers › Player 1** picks a device by hand (kept by its descriptor for every game) or **Automatic**.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on a POCO F7 Ultra with a GameSir X3 Pro (Forgejo issues #42, #62). Not yet checked on a phone with a Xiaomi uinput device.
+
+### A second controller on a player the game does not read
+
+- **Symptom:** in a two-player game a second controller does nothing, and every co-op start fails: the log has `input: device 13 (Xbox Wireless Controller) is player 3`, `hid: player 3's controller is not used: the game supports no npad 2`, then `hid controller applet: 2 to 2 players wanted, 1 connected: too few, closed as the player would (canceled)` at each try.
+- **Cause:** a Bluetooth controller paired during play came back as a new Android device (13) while its first device (12, player 2) was still listed. The new device took the next free player, 3, and when device 12 went away nothing moved it to the freed player 2. `pad_slots.h` keeps a freed player for the controller that left (so a controller that reconnects gets its player back), and the game reads only the npads it supports (`SetSupportedNpadIdType` {No1, No2}). On a Switch the controller applet assigns the connected controllers to the players the game asks for; the host's applet only counted them.
+- **Fix:** controllers on players the game does not read (`dm_pad_usable`: their npad is not supported) take the free players it reads in the order they press a button, as a Switch's controller applet hands out the players. `pad_slots.h` keeps each controller's last press (`pad_slot_press`), and `pad_slot_fill` moves one controller to the lowest free player the game reads, with its name: the one given, or the one that pressed last (the lowest slot when none pressed). The Android front end (`input_android.c`) moves a controller on its own press, which then reaches the game on its new player. `hle_hid.c` calls the front end back (`dm_pad_usable_callback`) when the supported npads change, and when the controller applet opens on a front end without a join screen, before the applet counts; then the controllers that pressed last move first. A disconnect moves no one: the freed player stays kept for its controller until another one presses, with one exception: when a device with the same name connected less than 3 s before and sits on a higher player, it is the same controller listed again, and it takes the freed player at once (`pad_slot_back`; Android's descriptor does not tell them apart, since a controller without a unique id gets a new descriptor while the old device is listed). In a one-player game nothing moves (every controller already feeds player 1). The launcher looks at the players once a second (`GameActivity.padPlayers`) and makes the rumble routes again when one moved (`Rumble.reroute`). The Mac and iOS front ends do not register the callback or record presses yet.
+- **Resolved** on Android by [The controller applet as a join screen](#the-controller-applet-as-a-join-screen): there the applet itself assigns the players, as on a console.
+- **Found on:** [Orbitals](../../dm/games/040032B023CA4000/README.md) on an AYN Thor (the built-in Odin Controller and an Xbox Wireless Controller over Bluetooth); the controller listed again also on [Super Mario Bros. Wonder - Nintendo Switch 2 Edition](../../dm/games/040015100B514001/README.md) (device 18 on player 2, device 19 on player 3: Wonder reads players 1 to 4, and asked for three players).
+
+### The game swaps or disconnects controllers
+
+- **Symptom:** after a second controller presses L + R at Super Mario Bros. Wonder's title, that controller does nothing, and only player 1's controller (or, on the next screen, neither) drives the game.
+- **Cause:** the game makes whichever controller presses at its title player 1 with `nn::hid::SwapNpadAssignment`, and it can let a controller go with `DisconnectNpad`. The host ignored both: the game took the Xbox controller for player 1 while the host still fed player 1's npad from the built-in controller.
+- **Fix:** `hle_hid.c` hands both to the front end (`dm_pad_assign_callback`, with players: player 1 on the connected npad, Handheld in handheld mode, else No1) and signals the npads' style events. On Android (`input_android.c` `on_assign`) a swap trades the two players' controllers with their state (`pad_slot_swap`: names, presses, labels, motion calibration); a disconnect lets the controller go: it has no player until its next button press (not a stick), which connects it again with its name and labels (`g_known`). `StartLrAssignmentMode` / `StopLrAssignmentMode` (Joy-Con pairing) only log, as the host has no Joy-Con. The Mac and iOS front ends do not register the callback yet.
+- **Found on:** [Super Mario Bros. Wonder - Nintendo Switch 2 Edition](../../dm/games/040015100B514001/README.md) on an AYN Thor (the built-in Odin Controller and an Xbox Wireless Controller): with the swap the Xbox controller drives the game after its L + R at the title.
+
+### The controller applet as a join screen
+
+- **Symptom:** a game's controller screen (`nn::hid::ShowControllerSupport`, the "press L + R" screen before local multiplayer) never shows: the host answered at once with the controllers already connected, so the players could not choose who plays, a controller on a player the game does not read stayed unused, and with too few connected the game got a cancel at every try (`hid controller applet: 2 to 2 players wanted, 1 connected: too few, closed as the player would (canceled)`).
+- **Cause:** the host had no screen to show and nothing to wait for. On a console the applet stays open while the controllers join by L + R, in the order they press, and returns the players it assigned.
+- **Fix:** on Android the applet is a join screen, every time the game opens it. `hle_hid.c` parses the game's `ControllerSupportArg` (`pad_join.h`: 0x430 bytes, read from the SDK's `SetDefault`, `SetExplainText` and `ShowControllerSupportCore` in Orbitals' SDK 21.4.2: min and max players, take over, left justify, single mode, a colour and a text per player) and hands it to the front end (`front_controller_support`), and the game's thread waits. `input_android.c` keeps the slots as they are while it shows and sends the pad keys to the join rules (`pad_join_key`), as the game's buttons (Button mapping, labels) and never to the game: the players are numbered in the order the controllers press L and R together, the first being player 1; with take over the controllers already on players the game reads start on them provisionally (left justify numbers them from player 1 without gaps), so A keeps them as they are, and the first L + R clears them and starts the numbering again from that controller. A on a joined controller ends it once at least the minimum (and one) joined; B cancels it only from player 1's controller (on a console the other players cannot); a controller that disconnects leaves its player. With no controller on player 1 the on-screen controls are its controller (the console's handheld one) and join by a button on the screen. On OK the joined controllers are the players (`join_apply`, with their labels and motion calibration); the others are not connected until they press a button, which connects them again as before (`g_known`). The launcher draws the screen (`CtrlScreen.java`: a card per player with the game's colour and text, Cancel, OK and the on-screen controls' join for touch) as an overlay that never takes the keys' focus, and reads the host's state (`nxhost_ctrl_state`) every 100 ms; Back cancels, and so does the game's screen closing for good. The game gets `{count, player 1's npad}` and OK, or 2202-3101. Without a front end that has a join screen (the Mac, iOS, the test) the applet answers at once as before. `jni_android.c` (other launchers, PORTING.md) does not bind the screen yet.
+- **Found on:** [Orbitals](../../dm/games/040032B023CA4000/README.md) (Play Local asks for two players) on an AYN Thor.
+
+### The join screen opened with nothing to choose
+
+- **Symptom:** (Android) the controller join screen comes up in a single-player game about a second after every change of Console mode in the in-game panel, and has to be closed with A each time; the log has the operation mode change, then `controller applet: the join screen opens for 1 to 1 players, 1 already joined`.
+- **Cause:** the mode change moves player 1's controller between the No1 and the Handheld npad (`dm_hid_opmode_changed`), the game sees its controller go and calls `nn::hid::ShowControllerSupport` for one player. Since [The controller applet as a join screen](#the-controller-applet-as-a-join-screen) every call opens the screen, also when one player is wanted and one controller is there.
+- **Fix:** `hle_hid.c` `ctrl_support` answers at once, without the front end, in two cases: one player wanted and no device besides player 1's holds a player (the answer is player 1); and the first applet within 5 s of an operation mode change when the connected players are at least the minimum (the players as they are, capped at the maximum). A second connected controller outside that window, or a game that asks for more players than are connected, opens the join screen as before. From Peanuts Native (igawa6/peanuts-native e368e74c2ed2); `t_hid` cannot tell it apart (it has no front end, and the applet answers at once there anyway), and it has not been run on a device here.
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) on an AYN Thor (Peanuts Native).
+
+### The phone's motion in the picture's frame
+
+- **Symptom:** on iPhone Duo's inner display the phone's gyro is turned a quarter turn: tilting up and down moves the pointer left and right, and the other way round ([GitHub issue #569](https://github.com/seedds/nxnative/issues/569)); the outer display is right.
+- **Cause:** Core Motion delivered the phone's samples in the hardware frame, and `DmGamepad.m` turned them into the Switch frame by the interface orientation (`motion_phone_to_switch`, `motion_fusion.h`). That holds only where the hardware frame is the screen's portrait frame, as on a phone with one display. The Duo's inner display is a quarter turn from it, and it ignores the app's supported orientations.
+- **Fix:** on iOS 27 and later the pad view, full screen over the picture, is the motion manager's `deviceMotionBody`: Core Motion then delivers rotation rate, gravity and user acceleration in that view's frame, for whichever display shows it and however it is turned, which is the Switch frame as it is (x to the right of the picture, y to its top, z toward the player), and the orientation map is skipped. iOS 26 keeps the map. No device model or fold state is checked.
+- **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md): the gyro pointer on the inner display, reported by klave7. Not yet tested on a device: on the Duo's inner and outer displays and on a phone with one display running iOS 27, `DM_MOTION_LOG=1` should read acc `0 0 -1` with the phone flat and still.
+- **Open:** while the scene is not full screen (Split View on the inner display) Core Motion falls back to the hardware frame without a flag that says so, and the samples are still taken as the view's frame.
+
+### Switch Pro Controller advertises motion but sends zeroes
+
+- **Symptom:** a Pro Controller's buttons work on the Mac, but its gyro pointer never moves; `GCMotion` callbacks arrive with acceleration and rotation all zero.
+- **Cause:** the macOS driver can expose empty motion through GameController while its underlying Nintendo HID `0x30` reports contain IMU data ([PR #296](https://github.com/seedds/nxnative/pull/296)). The OS driver lies outside this repository; the passive HID adapter is a workaround for that platform defect.
+- **Fix:** `motion_pro_mac.h` listens nonexclusively to vendor `057E`, product `2009`, without sending commands or changing the driver's configuration. `motion_pro.h` converts the three signed little-endian samples to G and rad/s in the Switch frame; their nominal 5 ms spacing reaches the shared integrator through `dm_motion_set_hid`. Each HID device owns its buffer and decoder. HID, GameController and phone orientations stay separate; usable GameController data wins, otherwise fresh HID data supplies that player's controller motion. Removal, focus loss or ambiguous routing clears only the HID source; 300 ms of silence expires it. `DM_MOTION_HID=0` disables the reader; `DM_MOTION=0` disables all motion.
+- **Routing limit:** GameController exposes no public per-controller HID identity. Raw motion is enabled only with one physical Pro and one GameController Pro, using that controller's existing player slot (including `DM_KBD_PLAYER=own` / `DM_PAD_MERGE`). Multiple Pros keep their GameController paths; raw data is never assigned to the first controller by guesswork. Synthetic GameController HID devices are excluded with Apple's `GCSyntheticDevice` property.
+- **Open:** passive reading cannot obtain factory calibration without issuing SPI commands alongside the OS driver. Nominal scales are 4096 counts/G and 70 mdps/count ([protocol research](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/imu_sensor_notes.md)); no automatic bias learning removes slow intentional turns. Sample order follows that research and [Linux hid-nintendo](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-nintendo.c); SDL reverses it. Confirm order, sensitivity, drift and reconnects on hardware before calling the reworked reader device-tested. `t_motion_pro`, `t_motion_pro_mac` and `t_hid` cover decoding, timestamps, ownership, removal, ambiguity and source fallback with synthetic inputs.
+- **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), docked pointer on a Pro Controller.
+
+### SDK 20 six-axis sensor and amiibo (`nfp`) calls
+
+- **Symptom:** SDK 20 calls that reach a service; `nfp`'s `AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`.
+- **Fix:** the console six-axis sensor (`hid::*SevenSixAxisSensor*`) reports zero states; more `nfp` calls are hooked: `AttachActivateEvent` / `AttachDeactivateEvent`, the two-argument `Mount`, `Unmount`, `GetCommonInfo`, `GetRegisterInfo`, `GetState`, `Finalize`. The host answers as a console with no amiibo.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, SDK 20.5.22). [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) 1.2.1 already initialized `nn::nfp` at boot ([A game update imports SDK calls the base game did not](#a-game-update-imports-sdk-calls-the-base-game-did-not)).
+
+### NFC initialization beside the amiibo library
+
+- **Symptom:** selecting amiibo initializes `nfp`, then the game connects to the unserved `nfc:user` service and aborts in `nn::nfc::Initialize`.
+- **Cause:** a game can call the general NFC library (`nn::nfc`) itself, beside the amiibo library (`nn::nfp`). The host takes over the whole `nfp` family, but `nfc::Initialize` stayed in the SDK and connected to `nfc:user`.
+- **Fix:** `hle_sdk16.c` takes over `nn::nfc::Initialize`, `Finalize`, `GetState` and `IsNfcEnabled`. Initialize and Finalize only track the library's state (no service session), and `IsNfcEnabled` answers false: a console with NFC switched off, so the game shows its own "NFC is disabled" message and returns to its menu. The `nfp` answers are unchanged. `dm/host/tests/t_nfc.c` checks the hooks. Of the games here, only Hyrule Warriors: Definitive Edition calls `nn::nfc` from its own code; the others have it only inside the `sdk` module.
+- **Open:** `nfp` answers as a console with NFC on and no amiibo ([SDK 20 six-axis sensor and amiibo (`nfp`) calls](#sdk-20-six-axis-sensor-and-amiibo-nfp-calls)), so a game that asks both libraries gets two different consoles, and the game's message points to a System Settings switch the host does not have. Answering `IsNfcEnabled` true would match `nfp`, but the game's amiibo path after it has not been run.
+- **Found on:** [Hyrule Warriors: Definitive Edition](../../dm/games/0100AE00096EA000/README.md) 1.0.1 (SDK 3.5.1), entering amiibo from the title screen (GitHub issue #708). With the fix, the message opens, closes and opens again.
+
+### The amiibo library's state before Initialize
+
+- **Symptom:** `game called nn::diag abort: Result 0, call site sdk+0x13ce58` in the middle of play, from `nn::os::TryWaitSystemEvent` on an event that was never set up (backtrace `main+0x1fb9920` in Tears of the Kingdom 1.4.3).
+- **Cause:** `nn::nfp::GetState` answered 1 (initialized) from the start. Breath of the Wild (`main+0x128ec7c`) and Tears of the Kingdom (`main+0xca5200`) call `nfp::Initialize` and `AttachAvailabilityChangeEvent` only when `GetState` is not 1, so they skipped the attach; Tears of the Kingdom's amiibo poll then waits on that event and the SDK aborts on its uninitialized state. Breath of the Wild also checks for 0 after `Finalize` (`main+0x128f964`).
+- **Fix:** `hle_sdk16.c` keeps the library state as on Horizon: 0 until `Initialize`, 1 until `Finalize`, like the `nfc` hooks beside it. `dm/host/tests/t_nfc.c` checks it.
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) 1.4.3 (GitHub issue #613; when the poll first runs was not found; the abort came after about 15 minutes of play, and was not reproduced here).
+
+### Vibration values flushed by the SDK's vibration graph
+
+- **Symptom:** abort in `nn::sm::Initialize` under `nn::hid::VibrationNode::Update`.
+- **Cause:** the SDK's vibration graph flushes queued values with `hid::detail::SendVibrationValues`, which opens the hid service. The game sets handles on its `VibrationTarget`s even when the host reports no vibration device.
+- **Fix:** the flush calls it through the PLT, so an `HLE_FORCE` on that symbol catches it and returns success (`hle_hid.c`).
+- **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md).
+
+### Forced vibration sessions
+
+- **Symptom:** at boot, `[RED] sf: the game connects to service hid itself`, then `CRASH sig=11 addr=0` in `hid::detail::EndPermitVibrationSession` (`sdk+0x3526bc` in SDK 9.4), under `hid::EndForcedVibrationSession`.
+- **Cause:** the SDK's own call opens the hid service, which sm refuses, and reads the null service object. A forced session lets an application vibrate while the system's vibration setting is off.
+- **Fix:** `hle_hid.c` answers `BeginForcedVibrationSession` and `EndForcedVibrationSession` with nothing to do. The host has no system vibration setting: its own rumble switch is the player's, and a session does not override it.
+- **Found on:** Super Mario Party (`010036B0034E4000`, no profile yet), [#2513](https://github.com/seedds/nxnative/issues/2513): the crash came before its first frame; with the fix it reaches the opening.
+
+### Whether a vibration device is mounted
+
+- **Symptom:** with rumble on, `[RED] sf: the game connects to service hid itself`, then `CRASH sig=11 addr=0` in `hid::detail::IsVibrationDeviceMounted` (`sdk+0x24254c` in SDK 7), under `hid::IsVibrationDeviceMounted`. With rumble off in the host's settings the game never asks.
+- **Cause:** the SDK's own call opens the hid service, which sm refuses (0xe15), and reads the null service object. Games ask only for handles `GetVibrationDeviceHandles` returned, which it returns none of with rumble off.
+- **Fix:** `hle_hid.c` answers it. On Horizon a device is mounted when the npad's connected controller has the handle's style and an actuator on that side; the host reports it mounted when the handle names a channel of the npad's controller (`vib_valid`), whether or not a haptics output is routed yet ([A vibration device before its controller connects](#a-vibration-device-before-its-controller-connects)).
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) 1.4.1, entering a Sand Kingdom pipe (`main+0x5d3150` asks for each handle of a controller whether any is mounted; GitHub issue #715). No other local game imports it.
+
+### A vibration device before its controller connects
+
+- **Symptom:** with rumble on, a game asks for vibration handles at boot, then sends one idle value and none for the rest of the session; nothing vibrates although a controller connects a few seconds later. `DM_RUMBLE_LOG=1` shows `GetVibrationDeviceInfo` answering mounted 0 before the pad connects.
+- **Cause:** `IsVibrationDeviceMounted`, `IsOunceVibrationDeviceMounted` and `GetVibrationDeviceInfo` answered from `vib_targets`, which keeps only the players with a routed haptics output. A game that asks once at boot, before a Bluetooth pad has connected, keeps "not mounted" for the session and never sends rumble. On Horizon the answer describes the npad's controller, not whether its motor is being driven yet.
+- **Fix:** `hle_hid.c`'s `vib_valid` is the handle and npad-style check behind `vib_targets` without the routed-output mask; the three calls answer from it. Sends keep `vib_targets` (a valid channel with a routed output), so values sent before routing are still dropped. From upstream nxnative e3230cc1 (PR #2859), the capability part only: upstream also lets the handles and `IsVibrationPermitted` follow the rumble setting, which rests on its earlier handle rework.
+- **Found on:** [The Legend of Zelda: Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md) 1.1.0, upstream (a Bluetooth pad on a Mac: one idle value before, about 400 values a second after).
+- **Check:** `t_hid` (both mounted forms and the left and right actuator answers before a route).
+
+### Whether an Ounce vibration device is mounted
+
+- **Symptom:** with rumble on, `[RED] sf: the game connects to service hid itself, which the host does not serve`, then an abort with Result 0xe15 at `sdk+0x6c8e54` under `nn::hid::detail::IsOunceVibrationDeviceMounted` / `nn::hid::IsOunceVibrationDeviceMounted`. In Ocarina of Time, the game aborts as soon as a button is pressed to play the ocarina (e.g. learning Zelda's Lullaby). With rumble off the game never asks.
+- **Cause:** in SDK 22 (Switch 2 / Ounce), `nn::hid::IsOunceVibrationDeviceMounted` replaces `IsVibrationDeviceMounted`. Its internal helper in the SDK attempts to open the `hid` service via `sm` (`CreateHidServerProxy`), which `sm` refuses (0xe15) because the host provides `hid` via HLE. The SDK checks the result and aborts. When rumble is off, `GetVibrationDeviceHandles` returns 0 handles, so the game's check skips calling `IsOunceVibrationDeviceMounted`.
+- **Fix:** `hle_hid.c` takes over `_ZN2nn3hid29IsOunceVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE` with `HLE_FORCE`. Like `IsVibrationDeviceMounted`, on Horizon a device is mounted when the npad's connected controller has the handle's style and an actuator on that side; the host reports it mounted when the channel has an output (`vib_targets`).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (update v131072, SDK 22.2.8), playing an ocarina note after learning Zelda's Lullaby on Android (Snapdragon 8 Elite, Turnip V39; report and player log).
+
+### Vibration handles before a controller is reported
+
+- **Symptom:** `DM_RUMBLE_LOG=1` shows the game's startup handle request answered with none, then every vibration value sent to handle 0 and reaching no output for the whole session, although a controller with haptics (a DualSense on the Mac) is connected. A game that rumbles would stay silent.
+- **Cause:** `hid::GetVibrationDeviceHandles` answered 0 handles until a controller's haptics were routed. Games ask once at startup, before GameController reports the pad, and keep the answer. On Horizon the handles are computed from the npad id and style alone (libnx `_hidGetVibrationDeviceHandles`).
+- **Fix (resolved):** the handles no longer wait for a routed output: with an output sink installed (`dm_haptics_has_output`), a connected npad style gets its handles even with rumble off; `vib_send` checks for a permitted, routed output at each send (`hle_hid.c`). A missing sink or a disconnected npad still yields no handles. `IsVibrationPermitted` follows the app's rumble setting when a sink is installed, independently of routed outputs ([A vibration device before its controller connects](#a-vibration-device-before-its-controller-connects)). `DM_RUMBLE_LOG=1` logs the handle requests and, once a second, the values sent, those with no routed output and the peak amplitude. Each input value is counted separately, including mixed batches; a mutex protects the diagnostic totals across game threads. `t_hid` covers cached startup handles delivering a nonzero value after routing, mixed-batch diagnostics and concurrent sends; `t_hid_tsan` checks those sends for data races.
+- **Found on:** [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (the Asian release, `010054B01AD92000`), in the log only: the game has no rumble of its own (it sends amplitude 0 throughout), so nothing could be felt before or after. A later [Echoes of Wisdom test](../../dm/games/01008CF01BAAC000/README.md) checks startup handles and device-info answers on a game that rumbles.
+
+### A vibration device before its controller connects
+
+- **Symptom:** with rumble on, a game asks for vibration handles at boot and gets two, then sends one idle value and none for the rest of the session; nothing vibrates although a controller connects a few seconds later. `DM_RUMBLE_LOG=1` shows `GetVibrationDeviceInfo` answering mounted 0 (and `IsVibrationDeviceMounted`, when asked, false) before the pad connects.
+- **Cause:** `IsVibrationDeviceMounted`, `IsOunceVibrationDeviceMounted` and `GetVibrationDeviceInfo` answered from `vib_targets`, which keeps only the players with a routed haptics output. A game that asks once at boot, before a Bluetooth pad has connected (the Switch 2 transport connects on a button press while the game runs), keeps "not mounted" for the session and never sends rumble. On Horizon the controller is there before the game boots.
+- **Fix:** `hle_hid.c`'s `vib_valid` is the handle and npad-style check behind `vib_targets` without the routed-output mask; the three calls answer from it regardless of the rumble setting, and `IsVibrationPermitted` follows the app's rumble setting with an output sink installed (`dm_haptics_enabled`), as the console's system setting does, instead of requiring a connected pad. `vib_targets` keeps the mask, so values sent before the pad connects are still dropped rather than played later.
+- **Found on:** [The Legend of Zelda: Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md); its game note records the before/after traffic and physical controller validation from [PR #2859](https://github.com/seedds/nxnative/pull/2859).
+- **Check:** `t_hid` (both mounted forms and actuator answers before a route and with rumble off, permission with no controller, values still dropped until permitted and routed); `t_hid_tsan` also queries capabilities and permission concurrently with sends and rumble-setting changes. Diagnostic counters are atomic across game threads.
+
+### Controller haptic engines without advanced players
+
+- **Symptom:** a controller (an Xbox Wireless Controller, a GameSir Super Nova, a GameSir Cyclone) never vibrates in a game on the Mac or the iPhone, though iOS Settings' Identify buzzes it; the log repeats `[RED] haptics: controller left handle create player: Couldn’t communicate with a helper application. (NSCocoaErrorDomain 4097)`. The engine itself starts.
+- **Cause:** the engines that `GCDeviceHaptics` makes are served by `gamecontrollerd`, which tells CoreHaptics whether it offers advanced pattern players (`HapticServerConfig.supportsAdvancedPatternPlayers`; its log: `Server returned: supports audio: 0 adv players: 0`). `-[CHHapticEngine createAdvancedPlayerWithPattern:error:]` does not check that; the request reaches the server, which refuses it, and the XPC reply comes back as NSCocoaErrorDomain 4097, on every locality (All, Default, Handles, Left Handle, Right Handle). The output made only advanced players (a looping 30 s event driven by dynamic parameters), and a player failure is retried on the same handle, so the fallback to the default locality could not help either. On the Mac the refusal also leaves that engine unusable: a plain player or a restart on it fails with -4810. A plain `CHHapticPatternPlayer` on a new engine plays and takes dynamic intensity and sharpness controls.
+- **Fix (resolved):** when the advanced player cannot be made, the channel drops that engine, makes a new one and keeps using plain players (`haptics_apple.m`, log line `has no advanced players … plain players`). A plain player cannot loop, and one stopped in the middle of an event left the Xbox controller's motors running at its level after the engine and the process were gone, until the controller was switched off. So plain players play pulses of 0.5 s that end on their own: the next one is scheduled where the last ends while the effect lasts, each starts at the current level (its pattern's initial control) and takes later levels as controls, and a stop sends level 0 to the playing pulses and stops the engine only after the last one has ended. Checked on an Xbox controller through the host's own `haptics_apple.m`: low and high levels are told apart, full level feels like a plain pattern at intensity 1, and the motors stop after the effect. `t_haptics_apple` covers a server without advanced players: the new engine, the pulses following each other, no pulse cut by a stop.
+- **Left and right handle engines override each other (current).** Without advanced players, the engines of `LeftHandle` and `RightHandle` playing at once were not felt on the Xbox controller, while one engine on `Handles` (or on `All`) at the same intensity was; a trigger engine playing beside them likewise drowned them out. So a split route whose first advanced player is refused becomes one engine on `Handles` (`Default` when the controller does not list it) that plays both motors mixed (`merge`, log line `plays both motors on one engine`): the rumble is the same on both sides. `t_haptics_apple` covers the merge.
+- **Low levels on rotating motors (open).** Controller motors and the Switch's resonant actuators disagree at low amplitudes, in two directions. The Xbox controller's motors showed nothing at intensity 0.05, a faint buzz from about 0.1 and a soft one at 0.3, so Breath of the Wild's charged attack (0.07 for about 3 s, `DM_RUMBLE_LOG=1`) was not felt even at `DM_RUMBLE_GAIN=2.5`. Mario Kart 8 Deluxe holds its low band at 0.1–0.4 all race long (about 30 changes a second, 0.84 peaks every few seconds): a texture on a Joy-Con, rumble that never lets up on a DualShock 4's motors. A floor with a square-root rise (0.15 + 0.85·√x) fixed the first and would make the second much worse, so the mapping stays linear. `DM_RUMBLE_MIN=0..0.9` (default 0) silences controller levels below it and stretches the rest over the full range, on every controller route; 0.45 leaves Mario Kart 8 Deluxe's crashes and drifts, as an emulator gives them on that controller. `t_haptics_apple` covers the cutoff.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0), on macOS 27.0.1 with an Xbox Wireless Controller over Bluetooth and an Xbox 360 USB receiver; [NieR:Automata The End of YoRHa Edition](../../dm/games/010056B015FE8000/README.md) (the Asian release, `0100B8E016F76000`) on an iPhone with a GameSir Super Nova in DualShock 4 mode, which plain players fixed; [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.1) on macOS 27.0.1 with a GameSir Cyclone; the same error in issue #219 (Sifu, provisional profile), controller unnamed.
+
+### DualShock 4 rumble through its effects report
+
+- **Symptom:** on the Mac, a DualShock 4 or a controller that presents itself as one (a GameSir Cyclone over Bluetooth: HID vendor `054C`, product `05C4`, `productCategory` "DualShock 4") does not rumble; Core Haptics failed on every locality with NSCocoaErrorDomain 4097 (issue #363, also in a minimal Swift app), while the same controller rumbles in an SDL-based emulator.
+- **Cause:** the Core Haptics route was the only one. SDL's hidapi driver does not use it for a DualShock 4: it writes the controller's effects report, which needs no haptics server and keeps the strong and weak motors apart, where a server without advanced players merges them (above).
+- **Fix (resolved):** on the Mac, a controller GameController calls a DualShock 4 is driven through that report when an IOHIDManager match on vendor `054C`, product `05C4` / `09CC` / `0BA0` is there (`ds4_route`, log line `rumble through the DualShock 4 effects report`): report `0x11` over Bluetooth (78 bytes, flags `0xC4`, rumble-only flag `0x01` so the light bar is left alone, CRC32 over `0xA2` and the first 74 bytes), `0x05` over USB (32 bytes), sent only when a motor byte changes. As the emulators feed SDL, the strong motor follows the low band and the weak one the high band (0.85 / 0.15 left / right), linearly, with `DM_RUMBLE_GAIN` and `DM_RUMBLE_MIN`. Without the HID device the controller keeps the Core Haptics route. GameController does not name a controller's HID device, so two DualShock 4s each get one, possibly swapped. `t_haptics_apple` covers the CRC and the fallback without the device; no test drives the report itself. iOS is unchanged.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.1) and [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0) with a GameSir Cyclone over Bluetooth on an M5 Pro, macOS 27.0.1: rumble on crashes and drifts (with `DM_RUMBLE_MIN=0.45`), on hits and chopping, stopping after each. Not checked: a genuine Sony DualShock 4, the USB report.
+
+### Scripted presses on a path of their own
+
+- **Symptom:** with a controller connected (a DualShock 4 here), `DM_KEYS` and `DM_CTL` presses are logged (`DM_KEYS: … press …`) but the game does not react to them, or only now and then; without the controller the same script works.
+- **Cause:** scripted presses went through player 1's controller path (`dm_pad_set`). A connected controller publishes its whole state there on every change, replacing scripted holds and sticks; the press latch preserves only the first read. Script release also cleared the physical controller's state.
+- **Fix (resolved):** `DM_KEYS` and `DM_CTL` set buttons, a press latch and sticks of their own (`script_set` in `hle_hid.c`), ORed with the keyboard / touch path and player 1's controller when the game reads player 1; for the sticks, the one deflected more wins. Shake includes the scripted path too.
+- **Check:** `dm/host/tests/t_hid.c` (`t_script`) runs the scripted publisher with a controller update during the hold: buttons survive repeated reads after the latch is consumed, the scripted stick wins over drift, shake continues, and release preserves physical input. Short presses are latched once, all four axes reach the handheld npad, and player 2 stays separate.
+- **Found on:** Batman: Arkham Knight (`0100ACD0163D0000`), reported in [PR #326](https://github.com/seedds/nxnative/pull/326) while driving the opening route with `DM_KEYS` and a DualShock 4. Reproduced independently in the host HID test without game files; its game profile is not in this checkout.
+
+### Touch gestures recognized from the touch points
+
+- **Symptom:** taps in handheld mode do nothing, though the game reads the touch screen (the title's PRESS ANY BUTTON, the menus' cards).
+- **Cause:** the game's touch handler (`main+0x42f1ac`) uses `GetTouchScreenState` only to track the finger and takes its taps, pans and swipes from `hid::GetGestureStates` (it acts on types 5–9), which the host answered with no entries.
+- **Fix:** the host now recognizes gestures from the same touch points, by yuzu's rules plus an 8 px slop before a touch counts as moving (`hle_touch.c` `gesture_sample`, unit test `t_gesture`; only in handheld mode, as touches): Touch, Press after 0.5 s, Pan, Pinch / Rotate with two fingers, Cancel on a change in the finger count, then Tap (IsDoubleTap within 0.35 s), Swipe above 400 px/s or Complete, and Idle. For every game.
+- **Check:** every menu, the cards, the map's drag and flick worked by touch with it. `DM_TOUCH_LOG=1` logs each gesture entry, and a `DM_CTL` line `drag <x0> <y0> <x1> <y1> [seconds]` moves a finger for testing pans and swipes on the Mac.
+- **Found on:** [Taiko Risshiden V DX](../../dm/games/0100346017304000/README.md) (SDK 12.3.3, Koei Tecmo's KTGL).
+
+### Mac pointer stays over the game
+
+- **Symptom:** on the Mac, the mouse pointer stays over the game picture while playing with a controller or the keyboard, in a window and in fullscreen ([issue #675](https://github.com/seedds/nxnative/issues/675)).
+- **Cause:** AppKit hides the pointer only for an app that asks, and `front_mac.m` never asked.
+- **Fix:** a key the game takes, a controller button or a stick past 15% (GameController and raw HID pads alike, `pad_set`) calls `[NSCursor setHiddenUntilMouseMoves:YES]` (`cursor_hide_for_input`), only while the game window is key, the app is active and the pointer is over the content view. AppKit shows the pointer again on the next mouse movement, and `input_release` shows it when the window loses focus. The mouse is the touch screen, so touching shows the pointer.
+- **Check:** with the pointer over the game, a controller button or the keyboard hides it; moving the mouse shows it; over the title bar, or with another app active, it stays.
+- **Found on:** every game on the Mac (general); [PR #584](https://github.com/seedds/nxnative/pull/584).
+
+### Mac display sleep during controller play
+
+- **Symptom:** the Mac dims or turns off its display and can reach the lock screen while the player is using a controller, in a window or in fullscreen.
+- **Cause:** macOS counts keyboard and mouse input as user activity, not a controller's, so its display-idle timer keeps running. The host's `NSActivityUserInitiated | NSActivityLatencyCritical` activity (`front_run`) prevents idle system sleep, not display sleep.
+- **Fix:** while the game window is key, `front_mac.m` holds a second activity with `NSActivityIdleDisplaySleepDisabled` (`display_awake`; `pmset -g assertions` shows `PreventUserIdleDisplaySleep` "NxNative active game window"). `input_release` lets go of it when the window loses focus or is minimized, `input_resume` takes it again, and startup takes it if the window became key before the focus observers were installed. Windowless runs never hold it. An explicit lock or sleep still works, and no input is synthesized.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) on the Mac, controller play; every game on the Mac (general); [PR #741](https://github.com/seedds/nxnative/pull/741).
+
+### Mouse, keyboard and key code maps
+
+- **Symptom:** the first boot aborted in `hid::GetMouseState` (the SDK's mouse resource was never initialized).
+- **Fix:** hooked: `hid::GetMouseState`, `hid::GetKeyboardStates`, and `kpr::GetKeyCodeMap`, which asks the settings service (`settings::detail::GetKeyCodeMap`) for the keyboard layout's map; the host leaves the map zero.
+- **Found on:** [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11, `GetMouseState`); [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11, `GetKeyboardStates`); [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (`kpr::GetKeyCodeMap`: the game zeroes a 0x1000-byte map and fetches it only once a keyboard reports keys, `main+0x1f0eb4`).
+
+### Poké Ball Plus (Palma)
+
+- **Symptom:** the first boot crashed in `hid::detail::SetPalmaBoostMode`, a null read at `sdk+0x238eb0` (the hid service never opened).
+- **Fix:** the Poké Ball Plus calls (`hid::*Palma*`, 26 functions) answer that none is connected: no npad has the Palma style, so the game never gets a connection handle, and every call on a handle fails (`hle_hid.c`).
+- **Found on:** [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) (SDK 7).
+
+### IR camera reported unconnected
+
+- **Symptom:** undefined `irsensor` imports found from the import list ([Listing a game's unhooked imports before they are met](#listing-a-games-unhooked-imports-before-they-are-met)).
+- **Cause:** Bezel Engine's input layer makes one (an IR camera) per controller and asks its status (`main+0x497f84`).
+- **Fix:** the IR camera (`irsensor`) answers every camera unconnected, and processors cannot run.
+- **Found on:** [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (SDK 11.4.3, NintendoWare Bezel Engine).
+
+## Software keyboard and applets
+
+### System applets opened by `Show…` calls
+
+- **Symptom:** null read in `sdk` under `nn::applet::CreateLibraryApplet` (Engage: title menu → DLC → `nn::ec::ShowShopAddOnContentList`); `Show…` overloads found in the imports before they were met.
+- **Cause:** every `Show…` call that opens a system applet (eShop, friend lists, web pages, error screens) goes through the applet proxy that `oe::Initialize` would have set up, and the host has none.
+- **Fix:** hook each `Show…` overload the game imports: list `main`'s undefined symbols containing `Show` / `Applet` and grep the host sources for each mangled name; one overload missing is enough to crash. The shop calls return `void` and act as if the player closed the shop (`hle_misc.c`); the friends and web ones return failure (`hle_friends.c`, `hle_offline.c`). `web::ShowOfflineHtmlPage` is cut, as `ShowWebPage`. `err::ShowNetworkServiceError` and `err::ShowApplicationError` are logged. Also hooked, found in the imports before they were met: the `ShowShopAddOnContentList(UserHandle)` overload, and the `ec::ShowShop…` overloads without an `ApplicationId` (they show the calling application's own pages). `ec::ShowShopSubscriptionDetails` is under [Shop service accessors](#shop-service-accessors).
+- **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md) (the shop calls); [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (`web::ShowOfflineHtmlPage`); [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) (SDK 7, `err::ShowNetworkServiceError`); [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11: `ShowShopAddOnContentList(UserHandle)`, `err::ShowApplicationError`); [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1: the overloads without an `ApplicationId`).
+
+### Library applets take the application's focus
+
+- **Symptom:** entering 2P stops the game on its 2P screen: the same frame repeats, the music plays, no controller does anything, until the window loses and regains focus (Mario Kart 8 Deluxe, every launch). With one controller, once that was fixed: the 2P character select ignores input while the log shows the controller applet opened again every few frames.
+- **Cause:** on Horizon a library applet takes the application's focus. am sends message 15 with OutOfFocus when it opens and 15 with InFocus when it closes, and the `Show…` call returns once it has closed. The host's stand-ins answered at once with no focus change. Mario Kart applies the controller applet's answer only after that InFocus notification: its notification thread (`main+0x8ea560`, blocking `PopNotificationMessage`) sets a flag on 15 with state 1, and the per-frame `main+0x87b5d0` takes the flag before it applies the answer (`main+0x87b300`). Second: with fewer controllers than the game's minimum, the host answered success with the connected count. A Switch never gives that answer (its applet waits for controllers until the player closes it), and the game, which asks for two in 2P, opened the applet again.
+- **Fix:** `hle_oe.c` counts open applets apart from the front end's focus. The game sees the front end's state, or 2 while an applet is open over a game in focus; each change of what it sees is one 15 (under focus modes 1 and 2, [Focus handling mode decides whether focus changes are notified](#focus-handling-mode-decides-whether-focus-changes-are-notified)). `DM_APPLET("name");` (`hle.h`) at the top of a stand-in holds the game out of focus until the stand-in returns: the controller applet (both overloads), strap guide and firmware update, `swkbd::ShowKeyboard`, the Mii editor, the user selector and creator, the error applets and the shop pages. Stand-ins that report the applet could not start (friends, web, the license notice, the album, amiibo) open none. The inline keyboard is left as it was: its applet draws into the game's own picture and is not believed to take focus (not checked). An instant open and close merges into one pending 15 that reads 1, which is all Mario Kart needs; a game that must see the 2 would need more. `ShowControllerSupport` with fewer players than the minimum (`ControllerSupportArg` +0) returns `ResultControllerSupportCanceled` (2202-3101), what the SDK's `ShowControllerSupportCore` (SDK 4.4.0 `sdk+0x24eeb0`) returns when the player closes the applet; Mario Kart goes back to its engine class menu, as on a Switch. `DM_OE_SCRIPT` now also starts for a game that only uses the blocking `PopNotificationMessage`.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.0 and 4.0.1; GitHub issue #550).
+- **Check:** `t_oe` and `t_hid` (`dm/host/tests`). On the Mac, from a save past the Mii pick: L+R at the title, Down, A (2P), A (Grand Prix), A (50cc). The log shows `oe library applet: controller support`, then `oe focus state → 2 (library applet open)` and `→ 1 (library applet closed)`, and the character select takes input. With one controller the applet logs `too few, closed as the player would (canceled)` once and the engine class menu comes back.
+
+### The software keyboard blocks only its caller
+
+- **Symptom:** the sound stutters and the input box lags while the player types a name (Octopath Traveler 0 on an iPhone: one 4.7 s frame, 5,035 wakeups a second instead of about 1,800, and no audio underruns).
+- **Cause:** the host froze the guest clock while `swkbd::ShowKeyboard` was up (d2r-mobile's choice, so that monsters did not attack while the player typed). Unreal calls it off its game thread, so the game kept running, and every thread that waits on the clock spun while its audio mixing starved. On the Switch the applet blocks only the caller while the clock runs.
+- **Fix:** the host now does the same (`hle_swkbd.c`). The iOS input box froze the clock a second time around its own wait (`front_ios.m`), so the first fix changed nothing on the phone (4,977 ms and 2,577 ms frames, 5,181 wakeups a second): look for every caller of `guest_clock_freeze_for`, the front ends included. The inline keyboard keeps the freeze: its game (Monster Hunter Rise) does not block on hardware at all, and the host's input box blocks it.
+- **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md).
+- **Check:** on the Mac `DM_KBD=<text> DM_TEST_SWKBD_HOLD_MS=8000` holds the keyboard up: frozen, 8.8 fps and 7,936 wakeups a second in that window; running, 30 fps and 1,788.
+
+### The inline keyboard as a resident library applet
+
+- **Symptom:** null read in `applet::CreateLibraryApplet` under `swkbd::InlineKeyboard::Initialize` (3D World, entering the save select after the character select).
+- **Cause:** the inline keyboard is a resident library applet whose results arrive through `Calc`.
+- **Fix:** `hle_swkbd.c` takes over every entry that touches the applet: `Appear` arms a request, and the next `Calc` asks for the text the way `ShowKeyboard` does (`DM_KBD`, else the front end's input box) and hands it to the game's changed-string and enter callbacks, or calls its cancel callback; `GetImage` reports no picture. `GetImageMemoryRequirement` is not a pure computation: it asks vi, hence the `vi::GetIndirectImageMemoryRequirement` hook ([vi layer and display calls without vi service objects](#vi-layer-and-display-calls-without-vi-service-objects)).
+- **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md).
+
+### Inline keyboard window size, setters and callbacks
+
+- **Symptom:** texture creation returns null right after the inline keyboard's `Initialize`, then a null read at `main+0x7713044`.
+- **Cause:** the game makes three textures of `swkbd::InlineKeyboard::GetWindowSize`, and the host answered 0 × 0 (its creation function returns null for a size of 0, `main+0x77112b8`).
+- **Fix:** it is 1280 × 720 as on hardware now. SDK 11 adds keyboard setters (window mode, key top alpha / scale / position, touch, hardware keyboard, user words, dictionaries; ignored) and two callbacks the applet makes from `Calc`: finished-initialize after `Initialize` and released-user-words after `UnsetUserWordInfo`. The host makes them on the next `Calc`.
+- **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md).
+
+### Inline keyboard text callbacks and `Calc` states
+
+- **Symptom:** the hunter's name box stays empty, then stays open with the name in it (Monster Hunter Rise, character creation).
+- **Cause:** the inline keyboard used to count every `Appear` as a cancel. The game also finishes the entry only when `Calc` returns 1 (ready / hidden) after a non-zero value (`main+0x6fb3e6c`); the hook returned nothing.
+- **Fix:** the text arrives through the enter callback, whose argument is the text inline (`char16_t[502]`, the length at +0x3EC; the changed-string argument adds three cursor positions at +0x3F0..+0x3F8: `ikb_str_arg`, read off the game's callbacks at `main+0x6fb3910` / `main+0x6fb3afc`). `Calc` now returns 0 until initialization finishes, 3 while shown and 1 otherwise. `SetFinishedKeyboardCallback` is called on the `Calc` after `Disappear`. AppearArg's `textMaxLength` (+0x20) limits the text.
+- **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md).
+
+### `nn::ngc::ProfanityFilter` vtable and by-name overloads
+
+- **Symptom:** `CRASH sig=10` at a heap address, called from `main+0x6bca160` right after the name was entered (Monster Hunter Rise); crash in `lmem::AllocateFromExpHeap` under `ngc::ProfanityFilter::MaskProfanityWordsInText` right after the character name is entered (DARK SOULS: REMASTERED); filter methods among the undefined imports with no hook, found from the import list before they were met (The Great Ace Attorney Chronicles).
+- **Cause:** `nn::ngc::ProfanityFilter` is polymorphic and Monster Hunter Rise masks the name through its vtable (slot 8, `MaskProfanityWordsInText(int *, char16_t *, uint32_t)`). The constructor hook did nothing, so the object kept what the heap held. Other games call the methods by name: DARK SOULS: REMASTERED calls the UTF-16 overload (`EPiPtj`) by name, and the host had taken it over only in the filter's vtable, so the SDK's version ran on a filter whose word list the host never loaded; The Great Ace Attorney Chronicles calls `ngc::ProfanityFilter::MaskProfanityWordsInText(int *, char *, uint32_t)`, `SetMaskMode` and `Finalize` by name rather than through the vtable.
+- **Fix:** the filter now gets a host vtable (`ngc_vtable` in `hle_misc.c`): each slot of the SDK's `_ZTVN2nn3ngc15ProfanityFilterE` is matched by address with the class's methods, and slots the loader already bound to forced take-overs keep them. The `unsigned short` and `char16_t` overloads are taken over by name too, as are the `char` overload, `SetMaskMode` and `Finalize` (`hle_misc.c`). Nothing is masked or reported.
+- **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (the vtable); [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (SDK 4.5.0; one boot: the UTF-16 overload by name); [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1: the `char` overload, `SetMaskMode`, `Finalize`).
+
+### `nn::ngc` China-region profanity check and mask
+
+- **Symptom:** `[RED] sf: the game connects to service ngct:u itself, which the host does not serve`, then `Break#1 reason=0 Result=0xe15` from the SDK when the player name is entered after a race (Cruis'n Blast).
+- **Cause:** `nn::ngc::CheckProfanityWordsInTextForPlatformRegionChina` and `MaskProfanityWordsInTextForPlatformRegionChina` are free functions, not `ProfanityFilter` methods. They go through `nn::ngc::t::Match`, which opens the `ngct:u` service, and the host does not serve it.
+- **Fix:** both are taken over by name in `hle_offline.c`, next to the newer `ProfanityFilter` overloads: the check reports no profanity, and the mask leaves the text unchanged.
+- **Found on:** Cruis'n Blast (0100B41013C82000, SDK 10, version 1.0.7; no profile in this repository).
+
+## Display, window and operation mode
+
+### `vi::CreateLayer` with the layer's size
+
+- **Symptom:** SIGSEGV in `vi::CreateLayer(Layer**, Display*, int, int)` (`sdk+0x3f9bc4`, from SDL3's Switch video driver at `main+0x239304`).
+- **Cause:** the overload with the layer's size; the host had only the two-argument one.
+- **Fix:** it returns the static layer (`hle_vi.c`).
+- **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (SDK 18.3.2, FNA on .NET NativeAOT with SDL3; one boot each).
+
+### `vi::CreateLayer` with `LayerCreationSettings` (SDK 22)
+
+- **Symptom:** SIGSEGV at `sdk+0x44ea94` reading address 0, in `vi::CreateLayer`, right after `am::GetSelfController()`; the caller is the game's window setup (`main+0x978cb6c`).
+- **Cause:** SDK 22 adds `CreateLayer(Layer**, Display*, const LayerCreationSettings*)`; the game builds the settings with the SDK's `LayerCreationSettings(int w, int h)` (`{w, h, 2}`, `sdk+0x4526a0`), and the SDK's `CreateLayer` asks the applet's self controller, which the host never made.
+- **Fix:** the host takes it over like the sized overload (`hle_vi.c`): the static layer, and the size recorded for an EGL surface.
+- **Found on:** [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md) (SDK 22.2.0): 1920x1080.
+
+### vi layer and display calls without vi service objects
+
+- **Symptom:** SIGSEGV in `vi::SetLayerCrop` or `vi::OpenDisplay` when opening a display by name.
+- **Cause:** the SDK's version dereferences vi service objects the host never made.
+- **Fix:** `SetLayerCrop` only records the crop for the present ([The NVN present crops by the vi layer crop](rendering.md#the-nvn-present-crops-by-the-vi-layer-crop)); `DestroyLayer`, `CloseDisplay` and `vi::Finalize` are host no-ops. Also hooked: `vi::GetIndirectImageMemoryRequirement` (asked by the inline keyboard's `GetImageMemoryRequirement`, [The inline keyboard as a resident library applet](#the-inline-keyboard-as-a-resident-library-applet)); `vi::ListDisplays` (one display, "Default"; the game lists 10 into a stack buffer and does not read them, `main+0x808f08`), found from the import list before it was met. `vi::OpenDisplay("Default")` returns the same static display as `OpenDefaultDisplay`, so applications can open the name returned by `ListDisplays` without entering the SDK's absent service client.
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) (SDK 8.2.0); [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10: `vi::GetIndirectImageMemoryRequirement`); [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1: `vi::ListDisplays`); Alien: Isolation (SDK 8.2.0: `vi::OpenDisplay`).
+
+### Switch 2 vi HDR, VRR and layer metadata calls
+
+- **Symptom:** a call through null (`CRASH sig=11 addr=0 pc=0`) with `lr` just past a game call to a `vi::SetLayerNextHdr…Metadata` / `vi::QueryDisplayHdr…` / VRR import; in the SDK the call goes on to `vi2`, whose backend table (or layer object) is still zero.
+- **Cause:** the Switch 2 SDK's `vi` versions forward to `vi2`, which is set up by the vi service the host replaces: its layer object and its dispatch table are never made.
+- **Fix:** `hle_vi.c` (block "Switch 2 SDKs: HDR, VRR and extended swap intervals") answers them as an SDR display at a fixed refresh rate: HDR off, no VRR, layer metadata accepted with nothing to apply, the extended swap interval left to NVN's. Every `vi::` import a Switch 2 game's `main` has should be checked against the hooks before the first boot ([Listing a game's unhooked imports](#listing-a-games-unhooked-imports-before-they-are-met)).
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) (`SetLayerNextHdrContentGamutMetadata`, `main+0x2036f4`); [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 (`SetLayerNextHdrAdjustableBezierMetadata`, `main+0x959ae4`, at the world-map loading screen; the only `vi::` import of its `main` no hook named).
+
+### Layer frame numbers
+
+- **Symptom:** SIGSEGV in `android::Surface::getQueuedFrameNumber` under `nn::vi::GetLatestFrameNumber`.
+- **Cause:** Unreal paces frames by the layer's frame number (`main+0x10140e8`); the SDK reads the vi service's surface, which the host never made.
+- **Fix:** `hle_vi.c` answers with the frames presented so far; `ListFrameHistory` returns no entries.
+- **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md).
+
+### Default display panel identifier
+
+- **Symptom:** SIGSEGV in `vi::GetDefaultDisplayPanelIdentifier` (`main+0xa9a4`, before the window).
+- **Cause:** the SDK's version calls through the vi service object the host never made. The game reads a u32 kind and, from kind 2, 0x14 more bytes; anything else makes it use zeros.
+- **Fix:** the host answers an all-zero identifier (`hle_vi.c`).
+- **Note:** a passed TV latency calibration in this game is saved per TV panel identity, the host's all-zero one included ([TV latency calibration's late, beat-timed listening window](game-state.md#tv-latency-calibrations-late-beat-timed-listening-window)).
+- **Found on:** [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md) (SDK 21.4.0, one boot).
+
+### oe calls answered without an applet proxy
+
+- **Symptom:** the first boot crashed in `oe::DisableAlbumImageTakenNotification`: a null read at `sdk+0x338070`, the first call in `nnMain` (`main+0x6b188c`); enabling those notifications also gives a null read at `sdk+0x33b0f0` (Xenoblade Chronicles 3); other `oe` calls that reach am, found in the imports before they were met.
+- **Symptom:** a null read at `sdk+0x36ec60` in `oe::EnableAlbumImageTakenNotification`, called from `nnMain` (`main+0x286268`).
+- **Symptom:** a null read at `sdk+0x32daa0` (`x0=0`) in `oe::SwitchLcdBacklightOn`, leaving Super Smash Bros. Ultimate's Vault > Sounds or opening My Music.
+- **Fix:** `EnableAlbumImageTakenNotification` uses the same host implementation as the disable call: no system-album notifications are produced. Found on [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md) (SDK 13.3.5); the next boot reaches the NVN frame loop.
+- **Cause:** the SDK asks am through the applet proxy the host never made.
+- **Album notification enable:** `oe::EnableAlbumImageTakenNotification` follows the existing disable takeover. The host produces no Horizon album captures, so enabling notifications produces no messages. Found on [Xenoblade Chronicles 3](../../dm/games/010074F013262000/README.md) (SDK 12.3.9, `main+0x127fac4`).
+- **Inactivity extension:** `oe::GetUserInactivityDetectionTimeExtensionMode` also reads the absent SelfController (`sdk+0x3391f0`, after Xenoblade Chronicles 3's opening movie). The host retains the requested mode: 0 initially or when either setter receives false, 1 for `SetUserInactivityDetectionTimeExtended(true)`, 2 for its `Unsafe` form. The boolean query is mode != 0, matching SDK 12.3.9's implementation. This state does not make the host turn the screen off. `t_oe` checks both setters and both queries.
+- **Fix:** hooked (`hle_oe.c`): `oe::DisableAlbumImageTakenNotification`; `oe::IsInStoreDemoModeEnabled` (no); `oe::GetDefaultDisplayResolution` and its change event; `oe::SendServerMaintenanceOverlayNotification`; `oe::SetUserInactivityDetectionTimeExtendedUnsafe`; `oe::GetPerformanceConfiguration`; `oe::SetAlbumImageOrientation`; `oe::Begin` / `EndAutoSleepDisabledSection` and `IsAutoSleepDisabled` (counted); `oe::ExecuteProgram` (logged red: the host runs one program); `oe::SwitchLcdBacklightOn` / `SwitchLcdBacklightOff` (am's CommonStateGetter: no-ops, the host leaves its display on and does not reproduce a screen turned off). The ones with a symptom of their own follow: [The startup logo](#the-startup-logo), [Copyright frame buffer overlay](#copyright-frame-buffer-overlay), [Applet resource user ID, launch parameters and VR mode](#applet-resource-user-id-launch-parameters-and-vr-mode), [CPU overclock calls without an apm session](#cpu-overclock-calls-without-an-apm-session), [Focus handling mode decides whether focus changes are notified](#focus-handling-mode-decides-whether-focus-changes-are-notified).
+- **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11: `GetDefaultDisplayResolution`, `SendServerMaintenanceOverlayNotification`); [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11: `SetUserInactivityDetectionTimeExtendedUnsafe`); [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10: `GetPerformanceConfiguration`, `SetAlbumImageOrientation`); [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (SDK 7.3.2: the auto-sleep calls); [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (`oe::ExecuteProgram`); [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1, Capcom's MT Framework: `DisableAlbumImageTakenNotification`, then `IsInStoreDemoModeEnabled` from the import list); [Donkey Kong Country: Tropical Freeze](../../dm/games/0100C1F0051B6000/README.md) (SDK 4.4.0: `GetUserInactivityDetectionTimeExtensionMode`, a null read at `sdk+0x15b73c` when the first level's cinematic camera starts, `CScreenDimmingUtil::DisableScreenDimming`); [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (SDK 8.2.1, 13.0.5: `SwitchLcdBacklightOn` from the Sounds menu, issue #2224). After all of its fixes The Great Ace Attorney Chronicles runs its frame loop at 30 fps; the black screen it showed was its textures, never uploaded (CPU-written textures, the profile's `tex_flush_upload` and `tex_dirty_upload`: [Mapped-range flushes taken as uploads (`tex_flush_upload`)](nvn-objects.md#mapped-range-flushes-taken-as-uploads-tex_flush_upload), [CPU writes with no flush, caught by page protection (`tex_dirty_upload`)](nvn-objects.md#cpu-writes-with-no-flush-caught-by-page-protection-tex_dirty_upload)).
+
+### The Switch 2's graphics scale sizes Mario Kart World's 3D scenes
+
+- **Symptom:** Mario Kart World 1.8.0 on the phone draws its 3D scenes at 1920x1080 handheld and 2560x1440 → 2048x1152 docked whatever the launcher's Game resolution says (`[RED] DM_WINDOW_SIZE=1920x1080: the profile has no window_fn row …`), and its swap chain stays 3 × 3840x2160 in both modes; only the window crop (`[nvn] WindowCrop`) follows the mode.
+- **Cause:** the game's window is not the size it renders at. Its display state takes the Switch 2 graphics scale from `nn::oe::GetCurrentGraphicsScale` (`main+0x8728f4` in 1.8.0, beside the operation and performance modes) and sizes every scene by it and by the operation mode; the final composite stretches the scene into the crop of its 3840x2160 window. The host answers scale 0 handheld and 1 docked, which are the game's two largest sizes. A `window_fn` row would change only the swap chain. The game has no `movz` / `ret` getter pair for 3840x2160.
+- **Fix:** `DM_GRAPHICS_SCALE=0`, `1` or `2` (`hle_oe.c` `gfx_scale`) answers that scale in every operation mode. `oe::GetGraphicsScalingParameters` answers the matching 10, 20 or 30, so the SDK's two queries agree. Without the switch the scale follows the operation mode as before. The log says `oe: graphics scale 2 in every operation mode (DM_GRAPHICS_SCALE)`. On a phone it is set through a game's own settings lines or `env.txt`. Other Switch 2 games read the scale differently: Donkey Kong Bananza keeps it as a quality tier ([its note](../../dm/games/040074A01BF12000/README.md)), so the switch is a per-game choice, not a default.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 ([Render resolution (Android; 1.8.0)](../../dm/games/0400C3F00006E000/README.md#render-resolution-android-180)); [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#render-size) (update v131072: the same display state, a size table indexed by mode and scale at `main+0x112c5e0`; found by disassembly, phone check open). The scale also changes while the game runs: [Graphics scale changes while the game runs (message 300)](#graphics-scale-changes-while-the-game-runs-message-300).
+
+### Graphics scale changes while the game runs (message 300)
+
+- **Symptom:** a game that sizes its scenes by the graphics scale kept the size it started with: Game resolution applied only at the next start, and an operation mode change in play (`dm_set_opmode`, `DM_OE_SCRIPT=opmode=…`) reached the game's mode but never its scale, though the host's answer to `oe::GetCurrentGraphicsScale` followed the mode.
+- **Cause:** the console posts applet message 300 when the graphics scale changes, as 30 for the operation mode and 31 for the performance mode. The Switch 2 SDK's notification handlers take 300 to `oe::GetCurrentGraphicsScale`: Mario Kart World 1.8.0 (`main+0x29957b8`, stored at +0x128 of its applet state, which a per-frame copy at `main+0x36ac10` hands on under the same mutex), Ocarina of Time (`main+0x3bc038c`) and Splatoon Raiders (`main+0x3e91528`), whose shared framework stores it at +0x2c and sets bit 0x100 of its change mask (bit 1 for the mode); all three turn it on with `oe::SetGraphicsScaleChangedNotificationEnabled`. The host kept that switch as a no-op, read the scale once and never queued 300.
+- **Fix:** `hle_oe.c` keeps the scale as runtime state beside the operation mode: `oe_state_set` stores the whole new state first, then queues 30 and 31 for a mode change and 300 for a scale change (a mode change changes the scale too while it follows the mode), each only when the game turned it on; 300 is merged while queued like 15, 30 and 31. A mode change also signals the default display resolution change events the game asked for. `nxhost_graphics_mode_set(scale, mode)` is the launcher's entry: the in-game panel's Resolution row sends the choice's `graphics_scale` row (`Profile.resolutionLive`; -1, -1 for Original without a row, the game's own) and saves the same per-game setting. The Vulkan present takes the window crop each frame (`vka_present.c`), so the new crop needs nothing more there. `DM_OE_SCRIPT=gscale=2@30` changes it on a schedule. The log says `oe: graphics scale setting …` and `oe notification popped by the game: 300`. Games whose Game resolution is a `window_fn` row (written into the code at load) or `res_levels` lists (rewritten in the game's read-only data at load) still take it at the next start, and the panel says so.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md#render-resolution-android-180), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#render-size) and [Splatoon Raiders](../../dm/games/0400380020056000/README.md#android) (found by disassembly 2026-11-10; whether each resizes its scenes on the phone is open).
+
+### The startup logo
+
+- **Symptom:** abort in `nn::sm::Initialize` under `nn::oe::FinishStartupLogo`, right after the first frames.
+- **Symptom:** SDK 21 `oe::EnableStartupLogoDisappearedMessage` reads null at `sdk+0x403fe0`, after `am::GetCommonStateGetter` returns null (Fit Boxing 3 2.0.0).
+- **Cause:** both reach the applet proxy: `FinishStartupLogo` through `am::GetApplicationFunctions`, the SDK 21 registration through `am::GetCommonStateGetter`.
+- **Fix:** the host has no startup logo (`hle_oe.c`): `FinishStartupLogo` is a no-op, and `EnableStartupLogoDisappearedMessage` queues message 95 (startup logo disappeared) at once through the notification queue and its event, since the logo is already gone. The number comes from the PR's run (the game popped it and went on); it was not found in the SDK's code.
+- **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md); Fit Boxing 3 (`0100AC101BFA2000`, provisional profile, no note; [PR #1973](https://github.com/seedds/nxnative/pull/1973)).
+
+### Copyright frame buffer overlay
+
+- **Symptom:** null read in `oe::InitializeCopyrightFrameBuffer`, right after the window setup.
+- **Cause:** the copyright frame buffer is an overlay the system draws only into screenshots and recordings; the SDK hands it to am as transfer memory.
+- **Fix:** `InitializeCopyrightFrameBuffer`, `SetCopyrightImage` and `SetCopyrightVisibility` are host no-ops (`hle_oe.c`).
+- **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) (SDK 9.6).
+
+### Applet resource user ID, launch parameters and VR mode
+
+- **Symptom:** SDK 20 calls that reach a service, each one boot; SDK 20's `OpenAudioRenderer` aborts on an ARUID of 0.
+- **Cause:** the SDK's own `applet::GetAppletResourceUserId` returns 0 without am, and SDK 20's `OpenAudioRenderer` aborts on that.
+- **Fix:** `applet::GetAppletResourceUserId` reports 0x80; the VR-mode calls (`pl::IsVrMode` / `BeginVrMode` / `EndVrMode`; `BeginVrMode` returns 0xd08e, the SDK's own refusal); `pctl::CheckStereoVisionPermission` (bool, not permitted: the host has no VR display); `oe::TryPopLaunchParameter` (none) ([The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) 1.9.0, SDK 20.5.22). `oe::GetPreviousProgramIndex` reports −1: launched from the home menu ([The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) 1.4.3).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md).
+
+### CPU overclock calls without an apm session
+
+- **Symptom:** a null read in `sdk+0x35258` (apm's session) in `oe::IsCpuOverclockEnabled`, the first call in `nnMain`; null read at `sdk+0x362b8` (`apm::SetCpuOverclockEnabled`) in the first calls of `nnMain` (`main+0x2e1e4c`).
+- **Cause:** `oe::IsCpuOverclockEnabled` and `oe::SetCpuOverclockEnabled(bool)` go through the apm session the host never opened.
+- **Fix:** `oe::IsCpuOverclockEnabled` is hooked; for `SetCpuOverclockEnabled` the host keeps the flag and the query reports it (`hle_oe.c`); it does not scale clocks.
+- **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11: `IsCpuOverclockEnabled`); [Taiko Risshiden V DX](../../dm/games/0100346017304000/README.md) (SDK 12.3.3: `SetCpuOverclockEnabled`).
+
+### Focus handling mode decides whether focus changes are notified
+
+- **Symptom:** the game freezes after switching apps and back, picture still, sound on; the main loop waits in its pause handshake (`main+0x5d10d4` / `main+0x5cea68`). Mac repro `DM_OE_SCRIPT=bg=1@20,bg=0@25`.
+- **Cause:** the game's own pause deadlocks. The game set focus handling mode 3. The SDK (`oe::SetFocusHandlingMode`, SDK 18 `sdk+0x3c5770`) turns modes 0 and 3 into "no focus notifications, the system suspends the game out of focus"; only 1 and 2 notify. The host sent message 15 anyway, and Galaxy 2's Wii layer ran a pause the console never triggers.
+- **Fix:** `hle_oe.c` now queues 15 only under modes 1 and 2 (or when no mode was set).
+- **Found on:** [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md) (one of two causes of the freeze; the other is [Guest clock reads wait while the app is in the background](#guest-clock-reads-wait-while-the-app-is-in-the-background)).
+- **Note:** modes seen: 1 Monster Hunter Rise; 2 Wonder, Breath of the Wild, Tears of the Kingdom, Link's Awakening, Cuphead; 3 Galaxy, Galaxy 2, 3D World, Odyssey.
+
+### Album calls fail with no album
+
+- **Symptom:** abort in `sm::Initialize` under `capsrv::InitializeForApplication` (`album::Initialize`); calls that reach the album service, found in the imports before they were met.
+- **Fix:** with no album they fail: `album::Initialize` (saving to the album now fails, `hle_offline.c`); SDK 7's `album::SaveScreenshot` without an orientation (fails); SDK 20's `SaveAndShareScreenshot` with a share ID and `GetSharePostedLastUrl`; `album::SaveCurrentScreenshot`.
+- **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11: `album::Initialize`); [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (SDK 7.3.2: `album::SaveScreenshot`); [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (SDK 20.5.4: the sharing calls); [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11: `SaveCurrentScreenshot`).
+
+## Accounts, network, shop and parental controls
+
+### Account, friends, play data and Nintendo Account calls
+
+- **Symptom:** a null read at `sdk+0x336ccc` in `pdm::QueryApplicationPlayStatistics` (Pokémon Sword, the second boot); undefined `nn::account::` / `nn::friends::` imports with no hook, found from the import list ([Listing a game's unhooked imports before they are met](#listing-a-games-unhooked-imports-before-they-are-met)) before they were met.
+- **Fix:** hooked (`hle_account.c`, `hle_friends.c`, `hle_offline.c`): `account::ListAllUsers`; `account::PushOpenUsers` (nothing to hand over); `account::LoadCachedNintendoAccountInfo` (fails: no Nintendo Account; Big Brain Academy then skips the birthday and country getters); `friends::GetBlockedUserList`, `DeclareOpen` / `DeclareCloseOnlinePlaySession` (unavailable); `friends::StartFacedFriendRequest` / `StartSendingFriendRequest` (fail); the Nintendo Account request's `GetAuthorizationCode` and `GetState` (both fail, as `GetIdToken`); `pdm::QueryApplicationPlayStatistics`, which asks how often this user launched two other games and reads only the launch count, so each is never played.
+- **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10, `ListAllUsers`); [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (`PushOpenUsers`); [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (the friends calls); [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the Nintendo Account request); [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) (SDK 7, `pdm`); [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md) (SDK 10.4.1: the friend requests); [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (SDK 11.4.3: `LoadCachedNintendoAccountInfo`).
+- **Note:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md)'s `account::OpenPreselectedUser` and `account::GetLastOpenedUser` are in [SDK calls that open a system service through sm](#sdk-calls-that-open-a-system-service-through-sm); SDK 6's `OpenPreselectedUser` in [SDK 6's `account::OpenPreselectedUser` returns a Result](#sdk-6s-accountopenpreselecteduser-returns-a-result); SDK 4's `GetBlockedUserList` without a `Uid` in [SDK 4's `friends::GetBlockedUserList` without a `Uid`](#sdk-4s-friendsgetblockeduserlist-without-a-uid); the save thumbnail calls in [Directory, file data cache and save-thumbnail calls](#directory-file-data-cache-and-save-thumbnail-calls).
+
+### `account::GetUserId` copies the Uid of any handle
+
+### An account AsyncContext needs its SDK constructor
+
+- **Symptom:** `CRASH sig=11` at `main+0x5b64f8`, `lr=main+0x3f1b8cc` (`nn.account.AsyncContext$$Finalize`), on an IL2CPP thread-pool worker a few seconds after the player confirms a name and birthday (Pokémon Friends 1.1.5). The object's first word, its vtable, holds stray bytes (`0xffffd256` in one run, `0x15600000128` in another). The game had started `account::EnsureNetworkServiceAccountIdTokenCacheAsync`.
+- **Cause:** `nn::account::AsyncContext` is polymorphic. The SDK's constructor (SDK 19.3.11: `sdk+0x1ad6c8`) writes the class's vtable and nulls the three words after it, the IPC object pointer at +0x18 among them, and sends nothing. The host took the constructor over with one that wrote no memory, so the vtable word kept what the allocator left there. The game's C# binding deletes the native context from the managed finalizer through the virtual deleting destructor, inlined in main (`main+0x5b64f0`: `if (p) p->vtable[1](p)`), which the host's `AsyncContextD1Ev` takeover never sees, and jumped through those bytes.
+- **Fix:** the constructor is no longer taken over (`hle_account.c`): the SDK's own runs. No host interface sets the IPC pointer, so the SDK's destructor, reached through the vtable, finds no session to close and frees the object. `friends::AsyncContext` and `account::NintendoAccountAuthorizationRequestContext` have no vtable (their SDK constructors write none), so their takeovers stay.
+- **Found on:** Pokémon Friends (`010008C01E742000`, update 1.1.5, SDK 19.3.11; no profile in the repository yet). The managed names come from Il2CppDumper's table ([IL2CPP method lookup](../development.md#il2cpp-method-lookup)).
+
+### The network account check is cancelled offline
+
+- **Symptom:** a "Transmitting" loading screen with a hint stays for ever before the main menu while the game keeps drawing at 60 fps and its music plays (Taiko no Tatsujin: Rhythm Festival). No red line, no crash; `DM_SF_TRACE=1` shows nothing after `nsd:u`. `DM_HLECOUNT` shows `account::EnsureNetworkServiceAccountAvailable` called thousands of times (4,647 in under three minutes, about once per frame).
+- **Cause:** the host's `EnsureNetworkServiceAccountAvailable` returned `RES_FAIL`. The SDK opens the account applet for account errors that require user interaction. Cancelling it returns `ResultCancelledByUser` (2124-0001, `0x27c`), as confirmed by replaying the SDK 13.3.0 path with a cancelled applet exit. Taiko takes that result as "continue offline" (`main+0x16ee0f4`: `and x8, x0, #0x3fffff; cmp x8, #0x27c`) and retries on anything else.
+- **Fix:** the call returns `RES_ACC_CANCELLED`, the result the user selector already gives on cancel (`hle_account.c`). The other network-account calls (`GetNetworkServiceAccountId`, `LoadNetworkServiceAccountIdTokenCache`) still fail.
+- **Check:** `make -C dm/host/tests GAME=<id> run` runs `t_account`.
+- **Found on:** Taiko no Tatsujin: Rhythm Festival (`01006B0016AD6000`, update 6.2.0, Unity 2020.3.26f1 IL2CPP, SDK 13.3.2; no profile in the repository yet). Before the fix, a cheat that rewrote main's import stub for the call (`main+0x1845440`, build `7150D78C454E7C55`) to return `0x27c` got it to the main hub.
+
+### Creating an ssl context needs no network
+
+- **Symptom:** a second controller ends the game with `FATAL account::GetUserId: the handle was not issued by the host (0x2)`, at boot with both connected or when the second joins during play (EA SPORTS FC 27 1.8d.6523; the FC 26 patch reports `(0x8)`).
+- **Cause:** the host checked the handle's third word against the marker its own open calls write. The SDK's accessor never reads that word: FC 27's `nn::account::GetUserId` (`sdk+0x1c0040`) calls `detail::GetUserId` (`sdk+0x1bede0`, `ldp x8, x1, [x0]; mov x0, x8; ret`), stores the 16 bytes and returns 0. For a second controller's player FC 27 passes a handle it built and never filled (`main+0x1f638b0`; words `0x7012222b20 0x400000001 0x2`), so on a console the call succeeds and returns those bytes.
+- **Fix:** `GetUserId` copies the Uid and returns 0 for any handle, as the SDK does (`hle_account.c`); the open calls still write the marker, which nothing checks. `t_account` covers the host's handle and built handles with third words 2, 8, 0 and all ones.
+- **Found on:** [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md) (PR #1129; two DualSense controllers on a Mac and an iPad Air M4, reported in its review thread); first found on EA SPORTS FC 26 by the [FC 26 120 fps patch](https://github.com/imnotsharingmyname/nxnative-fc26-120fps) (MIT).
+
+### The local user's profile image
+
+- **Symptom:** `Break#1 reason=0 Result=0` right after the first save is created, then exit 42; the stack has `nn::diag::detail::OnAssertionFailure` under `nn::image::JpegDecoder::Decode` (`sdk+0x394e4`), called from the game (Burnout Paradise Remastered, SDK 9.3).
+- **Cause:** `account::LoadProfileImage` failed with 0 bytes ("the host has none"). Every user on a console has a profile image, a 256x256 JPEG, and the game hands the buffer to `JpegDecoder` without checking the Result.
+- **Fix:** `hle_account.c` answers every user (`DM_USERS`) with the same image, a plain 256x256 baseline JPEG of 670 bytes built into the host: the size is the image's, the copy what the buffer holds.
+- **Found on:** Burnout Paradise Remastered (`0100DBF01000A000`, no profile; [issue #1118](https://github.com/seedds/nxnative/issues/1118)), from the reporter's symbolized stack; not run here.
+
+### Mii database answered by the host
+
+- **Symptom:** `[RED] sf: the game connects to service mii:e … mii:u itself`, then an abort.
+- **Cause:** `nn::mii::Database` keeps an `IDatabaseService` of the mii service at +0 (`Database::Initialize`, `sdk+0x1c5664`), and `AppendMii` / `ShowMiiEdit` start the MiiEdit applet.
+- **Fix:** `hle_mii.c` takes over the public methods: a console with no Mii of its own (an empty database: no index, nothing to update) that still has the six default Miis every console has. A CharInfo the host builds is the default Mii's parameters with Switch common colours, a create ID with version 4 and variant bits (fixed per default Mii, so a saved choice finds the same Mii; fresh for `BuildRandom`, which the title's demo race calls for 12 racers) and the nickname "no name"; every field is within `CharInfoRaw::Verify`'s ranges (`sdk+0x1b68c8`). The Mii editor is cancelled (0xE7E, which `ShowMiiEdit` itself treats as success).
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.0.0, SDK 4.4.0; one boot). The game asks for the default Miis with `Get(…, 6, SourceFlag 2)` and never reads the count (`main+0x81e954`): its boot-time list of Mii icons (`main+0x419dc8`) builds a head model for each of the six, and zeroed entries failed the model's `CharInfoAccessor::IsValid` (`CharModel::Initialize` returned 0xd67e, `main+0x8f15b0`) and crashed at `main+0x8f152c`.
+- **Note:** the heads' model data is a stand-in with every part empty ([System data stand-in for the MiiModel archive](#system-data-stand-in-for-the-miimodel-archive)).
+
+### Shop service accessors
+
+- **Symptom:** the abort with no message (`SVC 0x15` / `0x1f` / `0x21` placeholders, then `Break` with `sm::Finalize` under `ShopServiceAccessServer::Proxy::Initialize`) from `ec::InitializeForShopServiceAccessors`, called from Unreal's `FOnlineSubsystemSwitch::Init` at the start of `nnMain`.
+- **Cause:** the shop service accessor library reaches the shop service.
+- **Fix:** the library init succeeds with nothing to set up, an accessor never initializes, and its async response is complete at once with no data (`hle_misc.c`); the accessor and response are stubbed whole because the SDK's destructor aborts unless `Finalize` succeeds. Also hooked: `ec::FinalizeForShopServiceAccessors`, the shop response's `Cancel` and `GetErrorCode`, and `ec::ShowShopSubscriptionDetails`.
+- **Found on:** [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (SDK 7.3.2: the game then runs its opening movie at 30 fps); [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (SDK 19.3.1: `FinalizeForShopServiceAccessors`, `Cancel`, `GetErrorCode`, `ShowShopSubscriptionDetails`, found by the import list).
+- **Note:** the shop's `Show…` pages are under [System applets opened by `Show…` calls](#system-applets-opened-by-show-calls).
+
+### Offline purchased-item notifications
+
+- **Symptom:** a purchase watcher crashes in `nn::ec::InitializePurchasedEvent` after account selection, before it can wait for a notification.
+- **Cause:** the guest SDK initializer uses an add-on-content service object that the offline host never opened.
+- **Fix:** the purchased-item queue is empty offline. Its notification is a persistent, unsignalled system event that guest threads can wait on. Popping either form of purchased-item info returns false without writing a record.
+- **Found on:** [Super Kirby Clash 1.0.1 (#987)](https://github.com/seedds/nxnative/issues/987), SDK 7.4.0; [Star Fox](../../dm/games/0400E88025B1A000/README.md), SDK 21.4.4.
+
+### Parental controls and free communication
+
+- **Symptom:** abort in `nn::sm::Initialize` under `nn::pctl::IsFreeCommunicationAvailable` (Engage, entering its first battle map).
+- **Cause:** the SDK connects to the parental-control service through `sm`.
+- **Fix:** the host answers it like the other free-communication calls: not available by default (`hle_misc.c`). `pctl::CheckFreeCommunicationPermission` is refused unless an [opt-in co-op node](#opt-in-ldn-sessions-and-virtual-udp-sockets) exists.
+- **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md); [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (`CheckFreeCommunicationPermission`).
+- **Note:** `pctl::CheckStereoVisionPermission` is under [Applet resource user ID, launch parameters and VR mode](#applet-resource-user-id-launch-parameters-and-vr-mode).
+
+### Network interface, LDN, socket and play report calls
+
+- **Symptom:** play report calls met entering the save select (3D World); undefined `nn::ldn::` / `nn::socket::` imports with no hook, found from the import list before they were met (Big Brain Academy).
+- **Fix:** hooked (`hle_net.c`, `hle_offline.c`): the `nifm` IP queries with SDK 10's `socket::InAddr` / `in_addr` mangling; `prepo::AddSessionId` / `AddInternetConnectionStatus`; `ldn::GetNetworkConfig`; SDK 11's socket overloads with plain `sockaddr` / `int` arguments (`Connect`, `Accept`, `GetSockName`, `Get` / `SetSockOpt`, `Fcntl`, `Recv`, `Send`).
+- **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10: `nifm`, `prepo`); [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (SDK 11.4.3: LDN, sockets).
+
+### Opt-in LDN sessions and virtual UDP sockets
+
+- **Symptom:** a game cannot open a local-wireless session or exchange datagrams with a compatible host while `nn::ldn` and `nn::socket` receive the host's offline answers.
+- **Cause:** the platform's local-wireless service and its BSD datagram sockets need a shared session transport; allowing parental-control communication alone does not provide one.
+- **Fix:** the optional portable co-op module connects `nn::ldn` state, session and event calls with virtual UDP BSD descriptors (`hle_coop.c`, `hle_offline.c`, `hle_net.c`). Only an explicitly enabled, valid `DM_COOP` creates a node. Unset, empty, `off` or `0` leaves the existing offline answers, including `ENETDOWN`; a build without the module also stays offline. Configuration is read once per process, so restart the game to apply changes. This is local wireless over IP, not general Internet access, and the host has no title-ID gate.
+- **Settings:** `DM_COOP=auto[:<port>]`, `join:<IPv4>[:<port>]` or `host:<port>` selects the protocol role. The Android launcher exposes only joining on profiles that opt in. `DM_COOP_INTERNET=1` permits non-LAN endpoints, including Tailscale; a joining peer also needs `DM_COOP_ROOM`. The module authenticates with the room code but does not encrypt game traffic. See the [game instructions and verification limits](../../dm/games/0400A3A01EE4C000/README.md#link-play-on-android) before using a mode.
+- **Compatibility:** peers check the game build and gameplay-mod fingerprint during discovery and joining. Mismatched hosts are filtered and joins are refused; the [Pokopia instructions](../../dm/games/0400A3A01EE4C000/README.md#joining-a-pc-host) describe the vanilla PC settings needed by the Android adapter.
+- **Existing descriptors:** mixed `Poll` and `Select` serve both the virtual sockets (from descriptor `0x100`) and host eventfds; eventfd-only and empty waits retain their offline behavior. State-event bindings retain their event lifetime so a delayed co-op callback cannot signal an event object reused after destruction. Free-communication permission is granted only while a co-op node exists (`hle_misc.c`).
+- **Dependency:** Android host CMake takes `NX_COOP_VENDOR_DIR`; no `coop.h` builds with `NX_COOP_VENDOR=0`, while a header with a missing required source file fails configuration. The module is pinned and supplied separately; the [Pokopia note](../../dm/games/0400A3A01EE4C000/README.md#optional-module-and-provenance) records the tested source. Its diagnostic logs can expose addresses, room codes and node IDs; redact them before sharing.
+- **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md#link-play-on-android) (update 655360): earlier Android-to-PC joins over Wi-Fi and Tailscale; on `android` base `0bac816c` (2026-11-12), the Fold 7 on Turnip joined a Recompia 0.10.3 PC host over LAN with room authentication. Movement in both directions, normal visitor return home and subsequent host session shutdown were verified. Reconnection and current-source WAN/Tailscale traversal were not retested.
+
+### Server environment queries without nsd
+
+- **Symptom:** `[RED] sf: the game connects to service nsd:a itself, which the host does not serve` (also `nsd:u`), then `game called nn::diag abort: Result 0xe8d` and exit 134 during startup.
+- **Cause:** `nn::nsd::GetApplicationServerEnvironmentType` asks the nsd services for the console's server environment (`nsd::detail::ipc::GetApplicationServerEnvironmentType`) and aborts when the request fails; the host serves no nsd service. `nn::oe::GetServerEnvironmentType` is a single branch through the `sdk` module's PLT to it, in all 18 `sdk` modules on hand (Switch 1 and Switch 2 titles, Mario Golf: Super Rush and EA SPORTS FC 27 among them), so a game reaches it either way. The query asks for a fixed property of the console, not for a network connection.
+- **Fix:** `hle_offline.c` takes over `nsd::GetApplicationServerEnvironmentType` and returns `oe::ServerEnvironmentType` 1, retail `lp1`, as the existing `nsd::GetEnvironmentIdentifier` answer does (the game's table maps `0 dd1`, `1 lp1`, `2 sd1`, `3 sp1`, `4 dp1`). The forced takeover binds the `sdk` module's own PLT entry too, so `oe::GetServerEnvironmentType` needs no takeover of its own. Other nsd operations are not implemented. `t_server_environment` looks up the real registrations by name and checks the answer against the identifier.
+- **Found on:** Hogwarts Legacy (`0100F7E00C70E000`, SDK 17, no profile), in a contributor's bring-up ([PR #1199](https://github.com/seedds/nxnative/pull/1199); also [NX2Apple issue #475](https://github.com/LNPANDY/NX2Apple/issues/475)): with the takeover the game passed the call and went on rendering. No local game references either function. Hogwarts on the current host and PATAPON 1+2 REPLAY ([NX2Apple issue #426](https://github.com/LNPANDY/NX2Apple/issues/426)) are not checked (open).
+
+### Bluetooth LE at boot
+
+- **Symptom:** `[RED] sf: the game connects to service bt itself, which the host does not serve`, then `game called nn::diag abort` at `sdk+0x16ba48` and exit 134, a second after the audio renderer starts. With `bt` and `btm:u` served as zeroed host sessions the abort moves to `nn::btm::user::InitializeBtmUserInterface` (`sdk+0xb8eb4`), before either session gets a request.
+- **Cause:** `main` calls `nn::bluetooth::InitializeBle` at boot (`main+0xa0b030`; the Pokémon GO Plus + support of the 3.0.1 update), which runs `bluetooth::hal::user::InitializeBluetoothUserInterface` and `btm::user::InitializeBtmUserInterface` and aborts when they fail. Zeroed answers are not enough: the BTM setup expects real objects or handles back.
+- **Fix:** `hle_offline.c` takes over the BLE calls the game reaches without a device: `InitializeBle` connects to nothing, the five `AcquireBle…Event` calls bind an event that never fires, scan parameter, scan start and `ConnectToGattServer` fail, scan stop succeeds, and the scan result and connection lists are empty. The GATT calls after a connect are never reached.
+- **Found on:** [Pokémon Violet](../../dm/games/01008F6008C5E000/README.md) 3.0.1 (`v720896`, a derived profile), on an M3, macOS 27.2: the opening plays through. Not checked: 1.0.0 (the registered build), Pokémon Scarlet 3.0.1.
+
+### Network requests stay on hold before they settle
+
+- **Symptom:** the boot sits at a black loading screen for good, CPU nearly idle, every thread waiting, about 1 boot in 6 (3 in 4 with four Mac hosts at once); the title movie is never opened, and the save files are never probed.
+- **Cause:** a race the host's instant offline answers lost. The game's boot state machine (`main+0x1f2f0e0`, state at `this+0xd4`, found by probing the save probe's call stack and dumping the state each tick) stayed in state 7, which polls the status word (+0x14) of the game's BCAT news runnable ("OlimarMemo") for 0, 4, 5, 6 or 7; it read 1. The runnable's constructor (`main+0x203f3b0`) clears the status, starts `FBCATThread` and only then stores 1; the thread's `Run` (`main+0x203f510`) stores 2, calls `nn::nifm::SubmitNetworkRequest`, sleeps while `IsNetworkRequestOnHold`, and stores 6 when `IsNetworkAvailable` is false. On a Switch the request stays on hold while the nifm service evaluates it, so the constructor's 1 always comes first; the host answered "not on hold" at once, and a thread that ran before the constructor's store finished at 6, which the 1 then overwrote.
+- **Fix:** a submitted request is on hold for the first `IsNetworkRequestOnHold` after the submission and settled as unavailable at the next (`hle_net.c`). On Horizon each query is an IPC to the nifm service, which evaluates the request as it serves them, offline a rejection; Pikmin 4 sleeps 10 ms between its queries, so the constructor's store always comes first.
+- **Note:** the first fix held the request for 50 ms of host time. A game that bounds its wait by the number of queries never saw that end: Hades' `NetworkPollThread` (`main+0x27aaa0`) yields between queries and cancels after 2,000 (2,000 IPCs on a Switch, 0.1 ms here), then submits again at once, which kept a host core busy (1.17 billion queries a minute; with [A wait at two yields is not progress](threads.md#a-wait-at-two-yields-is-not-progress), 216,000 yields and half the CPU). Its stamp, `now_ns() | 1`, also read as settled whenever the next query came within the same 42 ns tick of the Mac's clock: 30% of Hades' submissions, and 42% back to back.
+- **Found on:** [Pikmin 4](../../dm/games/0100B7C00933A000/README.md) (Unreal Engine 4.26.2); [Hades](../../dm/games/0100535012974000/README.md) (the 50 ms hold).
+- **Check:** 12 of 12 boots with four hosts at once reached the title, with both fixes; a host that answers at once hung 1 of 4 in the same test.
+- **Note:** how it was found: the hung boots' logs diverged from good ones at the save probe (`DM_FS=1`), the thread dumps showed nothing but idle waits, and `DM_PROBE` on the state machine, then `peek` lines in a hung run's `DM_CTL` file, followed the pointers to the status word (a probe on the hot path slowed the boot enough to hide the race: 8 of 8 good).
+
+### Socket `Poll` and `Select` with nothing to wait on
+
+- **Symptom:** one thread at 100% CPU from boot, with one SVC in 99 s (`NexusRevolution Socket`, `main+0x92c7c4`, the game's network thread).
+- **Cause:** it calls `nn::socket::Poll(fds, 0, 33)`: no descriptors and a 33 ms timeout, which on hardware is a 33 ms sleep. The host failed every socket call at once, so the thread spun 11,000 times a second (88,000 hits of a probe in 8 s).
+- **Fix:** `Poll` and `Select` with nothing to wait on (no descriptors, or only negative ones, which POSIX ignores) now wait out their timeout and return 0, in every mangling the host takes over, including SDK 4's `Select(int, fd_set*, …, timeval*)`; an endless timeout returns 0 after 100 ms, since a thread inside a host hook pauses for IL2CPP's collector only once the hook returns (`hle_net.c`, `dm_guest_sleep_ns` in `hle_thread.c`).
+- **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (SDK 4.5.0; one boot). Guest CPU fell from 1,030 to 60 ms per second.
+
+## Settings, languages and fonts
+
+### Language codes
+
+- **Symptom:** the first comparison in `nnMain` aborted in `sm`.
+- **Fix:** hooked: `settings::LanguageCode::Make` and the reversed `operator==(LanguageCode, Language)`.
+- **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10).
+
+### A language tag such as fr-FR in DM_LANG gives the game's first language
+
+- **Symptom:** with `DM_LANG=fr-FR` (or `de-DE`, `es-ES`, `ja-JP`) the game starts in another language, Japanese in Mario Kart World; `DM_LANG=fr` gives French.
+- **Cause:** `GetDesiredLanguage` handed `DM_LANG` to the game as typed. The console's codes are the 18 of `nn::settings::Language` (`ja`, `en-US`, `fr`, `de`, …, `zh-Hans`, `zh-Hant`, `pt-BR`); a game compares the desired code with them and takes its first language when none matches. A BCP-47 tag, as a phone or a player writes it, is none of them.
+- **Fix:** `dm_lang_code` (`hle_oe.c`) maps a tag to the console's code: the codes themselves in any case, the language subtag with its region or script (`fr-FR` → `fr`, `fr-CA` → `fr-CA`, `es-MX` → `es-419`, `pt-PT` → `pt`, `en-AU` → `en-GB`, `zh-TW` / `zh-Hant-HK` → `zh-Hant`, `zh-CN` → `zh-Hans`), `_` as `-`; any other tag is `en-US` with a `[RED]` line naming the codes. `GetRegionCode` takes the mapped code. The log says what a tag was mapped to (`language: DM_LANG=fr-FR is fr`). The Android launcher's Game settings › **Game language** passes the phone's language (mapped the same way, `GameLanguage.java`) or a picked one. Tests: `dm/host/tests/t_oe.c`, `dm/tools/tests/test_android_gamelanguage.py`.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md#found-on-this-game) (a player's report, GitHub #44). Applies to every game.
+
+### A language the game does not ship (Android, phone set to Thai)
+
+- **Symptom:** `CRASH sig=11 addr=0x8` in the game's opening, after `[nvn] TextureViewSetSwizzle not identity`, with `DM_LANG=th` in the log's switches (a phone set to Thai; Game language on "Phone's language"). Ocarina of Time: `main+0xa7ec18`, a read at offset 8 of a null resource reference (the lookup at `main+0xa7e4c0` returns 0 for a resource that is not loaded).
+- **Cause:** a console's `oe::GetDesiredLanguage` returns one of the languages in the game's control data (NACP), never a system language the game lacks. The host gave the game whatever `DM_LANG` mapped to; Thai was added to the launcher in 0.3.13 (SDK 21's table) and phone locale `th` went to every game from then on. Ocarina of Time's language table names Thai (`THth`), its `Mals/` has no archive for it (16 languages, no `THth`, no European Portuguese), and its opening went on without a resource it had asked for. Games that fall back by themselves (Mario Kart World takes its first language) hide the same mistake. The reporter's 0.3.0 log has no `DM_LANG` and his crash logs (0.3.23, 0.3.24) have `th`; no log of 0.3.1 to 0.3.12 is attached, and Thai first reached a game in 0.3.13, so "regression since 0.3.1" is not shown.
+- **Fix:** the profile's `languages` key names the languages the game ships, and `dm_lang_limit` (`hle_oe.c`) replaces a language outside it by the nearest listed one (the other variant of the same language, else en-US, en-GB, the first listed), as a console does; no key, no limit. Ocarina of Time's profile lists its 16 (`Mals/`). Unit test: `t_oe`.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) (issue #290; whether the missing Thai archive is the whole of that crash is open until a phone with Thai runs it).
+
+### Chinese language aliases in settings comparisons
+
+- **Symptom:** `DM_LANG=zh-Hans` or `zh-Hant` reaches the game unchanged, but its startup menu falls back to Japanese; the older `zh-CN` or `zh-TW` spelling selects Chinese.
+- **Cause:** Odyssey 1.4.1's language selectors (`main+0x977b30`, `main+0x977d30`) compare the desired code through `settings::operator==(LanguageCode, Language)` with only the deprecated `Language::Chinese` (6) and `Taiwanese` (11) entries, never `SimplifiedChinese` (15) or `TraditionalChinese` (16); its control data lists Simplified and Traditional Chinese, which the NSP script spells `zh-Hans` and `zh-Hant` (it turns `zh-CN` and `zh-TW` into those too). The real operator compares bytes with `MakeLanguageCode`, so on the console the system must hand this game `zh-CN` / `zh-TW`; the host compared bytes the same way with `DM_LANG`'s spelling, so `zh-Hans` did not match `zh-CN` and `zh-Hant` did not match `zh-TW`.
+- **Fix:** both settings equality hooks share an alias-aware comparison (`hle_sdk16.c`): Simplified Chinese's two spellings match each other, as do Traditional Chinese's. The scripts stay distinct; `GetDesiredLanguage`, `LanguageCode::Make` and the available language list keep their original codes and indices. No title-specific override. This stands in for the system's choice of spelling, whose rule per title is not known (open): a game that compares the code with its own strings, or looks up `zh-CN`'s index in the available list, still needs the exact spelling. A synthetic full matrix tests both operand orders, malformed codes and the unchanged list.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (1.4.1, SDK 7.3.2; fresh-save Mac startup menus in Simplified and Traditional Chinese after the comparison fix).
+
+### Available language codes and their count
+
+- **Symptom:** abort in `sm::Initialize` under `nn::settings::GetAvailableLanguageCodes` (early in `nnMain`, `main+0x327888`); abort in `sm::Initialize` under `nn::settings::GetAvailableLanguageCodeCount()` (`main+0x117590`).
+- **Cause:** Paper Mario asks for up to 32 codes and takes the index of `oe::GetDesiredLanguage`'s code in the list as its language. Catherine compares `LanguageCode::Make(0 … count − 1)` with `GetDesiredLanguage`'s code.
+- **Fix:** the host lists the system's codes in `nn::settings::Language` order, the table `LanguageCode::Make` uses, and reports the count of that table (`hle_sdk16.c`).
+- **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) (SDK 15.3.2, the codes), [Catherine: Full Body](../../dm/games/0100BF00112C0000/README.md) (SDK 8.2.1, the count; one boot).
+
+### Region code from the language
+
+- **Fix:** `oe::GetRegionCode` answers from the language: Japan, the Americas, Europe or Hong Kong / Taiwan / Korea.
+- **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (SDK 20.5.4; found in `main`'s imports before the first boot).
+
+### Shared font address: BFTTF header or bare TTF
+
+- **Symptom:** the font engine runs on garbage; crash after the shared fonts load, looking up the "?" glyph (`main+0x6c73c0`, a font cache lookup returning null), with SDK 10's `ScalableFontEngine::LoadFont` failing with error 403 and `SetFont` with 301 on both stand-in fonts; or Japanese, Korean or Chinese text draws nothing in a Unity game while Latin text is fine (Patrick's Parabox's language menu showed three blank lines).
+- **Cause:** consumers read the shared font differently.
+  - The SDK's font engine calls `ScalableFontEngineHelper::Decode(ptr, size)`, which XOR-decodes in place unless the first word is the "already decoded" marker (LE `0x18029a7f`). So for a game that decodes it the system shared font must look like BFTTF: serve `marker + bswap(size ^ 0x49621806) + TTF` (`hle_sdk16.c`). Mario decodes the pointer and needs the 8-byte BFTTF header in front.
+  - 3D World records shared fonts as type 0 (`main+0x975658`), calls no `ScalableFontEngineHelper::Decode` and hands the `GetSharedFontAddress` pointer straight to `LoadFont`, so the pointer must be the plain TTF. SDK 10 and older games all take the plain TTF.
+  - Unity's Switch player hands the shared fonts straight to FreeType. In Patrick's Parabox (SDK 13) the game's one font (Jost, a Unity dynamic font) falls back to the OS fonts for those glyphs, and the player loads them from the shared fonts: `main+0x2390b0` maps the names `Switch_Font_STD`, `Switch_Font_CN_Simplified`, `Switch_Font_CN_Extended`, `Switch_Font_CN_Traditional`, `Switch_Font_KR` and `Switch_Font_NIN_Extended` to types 0–5 and hands `GetSharedFontAddress` / `GetSharedFontSize` straight to FreeType's `FT_New_Memory_Face` (`main+0x23b2e0`), as libnx homebrew does with the same pl offsets. The host gave every SDK 11+ game the 8-byte BFTTF header in front, so every face failed to open.
+  - The SDK's `GetSharedFontAddress` is the shared memory base plus the pl service's offset, with no adjustment, and that offset points past the header (yuzu's pl service: "font offset and size do not account for the header"); Captain Toad (SDK 8) records its shared fonts as plain TTFs and calls `Decode` only for its BFTTF formats.
+  - A game on a newer SDK can import `Decode` (and so get the header) yet hand the address straight to `LoadFont` the same way (The Legend of Zelda: Echoes of Wisdom 1.1.0, SDK 20.5.1: `main+0x8b37c` crashed at address 0x38).
+- **Fix:** the host first decided by the SDK version alone (SDK 10 and older the TTF, SDK 11+ the header). Now the address is the header (marker form above) only for a game on SDK 11 or later whose `main` or an NRO imports `nn::fontll::ScalableFontEngineHelper::Decode` (Wonder, Breath of the Wild, Tears of the Kingdom, Pokémon Legends: Z-A); every other game gets the TTF itself (`font_skip` in `hle_sdk16.c`, `dm_game_imports` in `loader.c`; the profile key `shared_font` overrides). The host's `LoadFont` takeover passes the TTF past the header whenever it is given the host's own BFTTF base, so the address form `font_skip` picks only matters to `Decode` and other readers (`hle_sdk16.c` `h_font_LoadFont`).
+- **Check:** 3D World's case was found by probing the engine's error code after each call (`DM_PROBE` on the instruction after `GetError`).
+- **Note:** of the games on hand, the ones that call `GetSharedFontAddress` without importing `Decode` are all Unity players (Engage, Ace Attorney Investigations Collection, Brain Memory Training Academy, Patrick's Parabox). To see which fonts a Unity game asks for, probe its name mapper's entry (`DM_PROBE=main:2390b0` on Patrick's Parabox 1.0.1; the function is the one `main` caller of `GetSharedFontLoadState`).
+- **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10, the plain TTF); [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md), [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (the `Decode` importers); [Patrick's Parabox](../../dm/games/0100E44016C22000/README.md) (the blank CJK text, 1.0.1); [Captain Toad: Treasure Tracker](../../dm/games/01009BF0072D4000/README.md) (SDK 8, plain TTFs); [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md), [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md), [Brain Memory Training Academy](../../dm/games/0100F5D01DA3A000/README.md) (the other Unity players); The Legend of Zelda: Echoes of Wisdom 1.1.0 (no profile).
+
+### Shared fonts requested all at once
+
+- **Symptom:** abort in `nn::sm::Initialize` under `nn::pl::sharedresource::GetPlatformSharedResourceManager` (first thing in `nnMain`).
+- **Cause:** the game asks for every shared font at once with `pl::GetSharedFont(int *, SharedFontData *, int, LanguageCode)` (`sdk+0x40f270`), not by type. `SharedFontData` is 0x18 bytes {u32 type, address, size}; the SDK adds the pl service's offsets, which point past each font's 8-byte BFTTF header, to the shared memory base, and the game hands each address straight to `ScalableFontEngine::LoadFont` (`main+0x501ff0`).
+- **Fix:** the hook returns the six types in order with the stand-in TTFs past the header, whatever the profile's `shared_font` (`hle_sdk16.c`).
+- **Found on:** [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md) (SDK 21.4.0, one boot).
+
+### Shared font load request
+
+- **Fix:** `pl::RequestSharedFontLoad` is hooked (an SDK 20 call that reaches a service).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, SDK 20.5.22).
+
+### Nintendo-extension glyphs for button icons
+
+- **Symptom:** controller-button icons in text show as `?`.
+- **Cause:** those glyphs come from the system shared font's Nintendo-extension set (private-use code points; Mario's `GameMsg/Key.msbt` uses U+E0E0–E0F0 for A/B/X/Y/L/R/ZL/ZR/SL/SR/D-pad/+/−, U+E0AB–E0AE for D-pad directions, U+E090–E097 for stick arrows, U+E100/E101 for sticks).
+- **Fix:** `dm/tools/make_ext_font.py` generates a stand-in `nintendo_ext.ttf` with those icons; the host serves it for shared-font type 5 (`DM_FONT_DIR` or `DM_SHARED_FONT_EXT`) and a desktop font for the other types.
+- **Note:** to find which code points a title uses, scan the `TXT2` sections of its MSBT files for U+E000–F8FF.
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
+
+### Shared fonts on iOS
+
+- **Symptom:** on a phone, `GetSharedFontLoadState` would report "not loaded".
+- **Cause:** the macOS stand-in path (`/System/Library/Fonts/Supplemental/Arial Unicode.ttf`) does not exist on a phone.
+- **Fix:** the iOS app ships `dm/font/standard.ttf` and `dm/font/nintendo_ext.ttf` (copied / generated by `build_ipa.sh`) and sets `DM_FONT_DIR`.
+- **Found on:** every game on iOS (general).
+
+### A shared font larger than the game's font engine memory
+
+- **Symptom:** a crash after the shared fonts load, looking up the "?" glyph (`nro0+0xaef8a8`, a null pointer from nn::font's texture cache), with `ScalableFontEngine::LoadFont` returning 201 on one engine and 0 on another, and `SetFont` 301; or `[RED] more than 16 font engines with a small work buffer: this one keeps the game's`.
+- **Cause:** a game sizes an engine's work memory for Nintendo's fonts, and the host's stand-in can need more for its tables: on the Mac, Arial Unicode (23 MB, about 50,000 glyphs); Android's (Noto Sans, dm/third_party/fonts) is smaller, and whether it fits 50 KB was not checked. [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md) gives its first engine 512 KB and its second, the one its glyph thread uses, 50 KB, so `FSS_load_font` ran out of memory on the second (201). Its error is ignored: the name stays unknown to that engine, `SetFont` fails, and every lookup misses.
+- **Fix:** `ScalableFontEngine::Initialize` gives an engine with less than 512 KB that much host memory (`hle_sdk16.c`, `FONT_WORK_MIN`). The game's buffer stays unused, and `GetPointerToWorkBuffer` still returns it, as the game frees that. The registry grows with the engines instead of stopping at sixteen. Both `Initialize` and `Finalize` preserve the SDK's integer result. A successful `Finalize` releases the host backing after the SDK returns; a failed initialization or finalization retains it until successful cleanup or replacement. Reinitializing with a large game buffer updates the pointer immediately and releases the old backing when initialization succeeds.
+- **Lifetime:** the SDK retains its work-pointer accessor after `Finalize`, so the host keeps a small engine-to-game-pointer record after releasing the enlarged buffer. Reinitialization updates that record; a successful large-buffer initialization removes it. Records for finalized engine addresses that are never reused remain until process exit (32 bytes each on arm64). Calls on the same engine still require the SDK's caller-side serialization. The takeover covers imported lifecycle calls; calls compiled directly inside a guest module bypass it.
+- **Found on:** [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md) (SDK 20.5.17). [Kirby's Dream Buffet, issue #1569](https://github.com/seedds/nxnative/issues/1569), reports `[RED] more than 16 font engines with a small work buffer`; this establishes registry exhaustion, not the cause of its later crash. That crash and gameplay remain unverified.
+
+## C library, time and random numbers
+
+### Time zone rules, calendar conversion and the network clock
+
+- **Symptom:** saves dated 18:00:02 31/12/1969 (`ToCalendarTime: first conversion 2 → 1969-12-31 18:00`), and Continue, which takes the newest save, loads an older one.
+- **Cause:** the host failed `time::StandardNetworkSystemClock::GetCurrentTime`, and the game kept the PosixTime it had (2). A Switch keeps its network clock from its last time sync, so one that has ever been online reads it offline too. The SDK's `StandardNetworkSystemClock::now()` never calls `GetCurrentTime`: it reads the time service once its own initialized flag is set, which the host's `Initialize` take-over never sets, and returns 0 (1970) otherwise ([Ocarina of Time](../../dm/games/0400486024DEC000/README.md)'s `sdk+0x5d8490`).
+- **Fix:** the network clock is the host's clock, as the user clock (`DM_FIXED_TIME` included), since the host's clock is set from the network: `GetCurrentTime`, `now()`, and the network fields of the host's clock snapshots ([below](#steady-clock-clock-snapshots-and-user-clocks)). `t_time` checks all three. Also hooked: `time::ToPosixTime` (host `mktime`), and `time::ToPosixTime` with an explicit rule (the host's zone, as for `ToCalendarTime`); `time::LoadTimeZoneRule` and the `ToCalendarTime` overload with a rule (the host's zone is used); `time::StandardNetworkSystemClock::IsAccuracySufficient` (no: the host does not know when its clock last synced). The network clock's context and the adjustable clocks follow the same rule ([below](#the-adjustable-network-clock-aborts-in-adjust)). `time::GetDayOfWeek` is a pure computation and needs nothing.
+- **Reach:** `main` calls the network clock in [Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [Mario Kart World](../../dm/games/0400C3F00006E000/README.md), Minecraft Dungeons II, [PRAGMATA](../../dm/games/0400C76024710000/README.md), Super Mario Party and [Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (`now()` too); [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) and [Shield](../../dm/games/01008DB008C2C000/README.md), [Brilliant Diamond](../../dm/games/0100000011D90000/README.md) and [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) import it.
+- **Found on:** Divinity: Original Sin 2 (`010027400CDC6000`, SDK 8.2.0, not in the games table; brought up in DroidPlay Core, an Android fork that shares this host, from [PR #2359](https://github.com/seedds/nxnative/pull/2359): the network clock); [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11, `ToPosixTime`); [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (SDK 11, the rest); [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (`GetDayOfWeek`); [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11, `ToPosixTime` with an explicit rule, found in the imports before it was met).
+
+### The C library's local time is UTC, as on a Switch
+
+- **Symptom:** times a game shows through the C library are off by the host's UTC offset: Hades II's load screen dated a save made at 01:44 KST (UTC+9) 16:44 the day before, its UTC time. The save file itself holds the right time.
+- **Cause:** the host took over `localtime`, `localtime_r` and `mktime` with its own local-time functions, on the belief that the SDK converts by the system time zone. It does not: the SDK's musl time zone helper (`__secs_to_zone`) is a fixed stub (offset 0, no daylight saving, name `"UTC"`) in every `sdk` checked, SDK 3.5.0 to 22.2.10 (Xenoblade Chronicles 2 to EA SPORTS FC 27, the Switch 2 builds included). Local time on a Switch comes only from `nn::time`. Hades II turns its save header's time into a UTC `struct tm` with `gmtime_r`, back into seconds with `mktime`, then into a calendar with `time::ToCalendarTime`. The host's `mktime` read the UTC `tm` as local time, 32,400 s early in KST, and `ToCalendarTime` added the offset back once. The take-over came from the D2R port, whose chronicle times (`localtime` + `strftime`) differed from the wall clock by the zone's offset. They do on a Switch too.
+- **Fix:** the take-overs are gone, so the SDK's own functions run. The pass-through table (`hle_table.c`), used only when no module defines them, maps `mktime` to the host's `timegm` and `localtime_r` to `gmtime_r`. `nn::time` keeps converting in the host's zone ([above](#time-zone-rules-calendar-conversion-and-the-network-clock)). `t_time` checks both with `TZ=Asia/Seoul`.
+- **Found on:** [Hades II](../../dm/games/0100A00019DE0000/README.md) 1.0.141667 (SDK 20.5.15; [issue #2784](https://github.com/seedds/nxnative/issues/2784): `gmtime_r` from `main+0x4301bc`, `mktime` from `main+0x430a4c`, `ToCalendarTime` from `main+0x430d18`).
+
+### DM_ONLINE: what a game's online check reads
+
+- **Symptom:** Pokopia shows OFFLINE and hides an event that needs a first online connection although `nifm::IsNetworkAvailable` and the network clock report online.
+- **Cause:** the game's checks go through more than nifm: a monitor thread polling `IsNetworkAvailable` every 3 s, a request task (Submit, on-hold query, availability, `HandleNetworkRequestErrorResult`), and an HTTP layer asking `nifm::GetCurrentProxySetting` and `nsd::ResolveEx` before each request. Which of them the label reads is open; a label that follows a server answer cannot be faked here.
+- **Fix:** with `DM_ONLINE=1` the proxy query succeeds with no proxy and `nsd::Resolve` / `ResolveEx` keep the name (sockets still fail, nothing is sent). `DM_NET_TRACE=1` logs each such call with its result (`[net]` lines) so a phone run shows the order. Open: the decision path.
+- **Found on:** [Pokemon Pokopia](../../dm/games/0400A3A01EE4C000/README.md).
+
+### DM_ONLINE: what a game's online check reads
+
+- **Symptom:** Pokopia shows OFFLINE and hides an event that needs a first online connection although `nifm::IsNetworkAvailable` and the network clock report online.
+- **Cause:** the game's checks go through more than nifm: a monitor thread polling `IsNetworkAvailable` every 3 s, a request task (Submit, on-hold query, availability, `HandleNetworkRequestErrorResult`), and an HTTP layer asking `nifm::GetCurrentProxySetting` and `nsd::ResolveEx` before each request. Which of them the label reads is open; a label that follows a server answer cannot be faked here.
+- **Fix:** with `DM_ONLINE=1` the proxy query succeeds with no proxy and `nsd::Resolve` / `ResolveEx` keep the name (sockets still fail, nothing is sent). `DM_NET_TRACE=1` logs each such call with its result (`[net]` lines) so a phone run shows the order. Open: the decision path.
+- **Found on:** [Pokemon Pokopia](../../dm/games/0400A3A01EE4C000/README.md).
+
+### Steady clock, clock snapshots and user clocks
+
+- **Symptom:** SDK calls that reach the time service, each aborting in `sm::Initialize` (or found in the imports before they were met).
+- **Fix:**
+  - `time::StandardSteadyClock::GetCurrentTimePoint`: host monotonic seconds, fixed source ID; `GetSpanBetween` runs in `sdk` ([The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) 1.9.0, SDK 20.5.22).
+  - `time::ClockSnapshot::CreateWithStandardSystemClock` and `CreateWithAdjustableSystemClock`: 0xD0 bytes, filled on the host from the steady clock, the user clock and the calendar; the network fields are the user clock's, as the network clock is ([Time zone rules, calendar conversion and the network clock](#time-zone-rules-calendar-conversion-and-the-network-clock)), so two host snapshots take their span from their steady time points and one made on a Switch from the network times. The type byte at `+0xcd` is 1 for standard and 2 for adjustable snapshots (0 means uninitialized), as verified in [Tears of the Kingdom's SDK](../../dm/games/0100F2C0115B6000/README.md#services). The adjustable entry also dereferences the absent time-service session without a host take-over. `t_time` checks both registrations, guarded buffers, the adjustable calendar and location, and snapshot arithmetic. The adjustable crash and boot fix were reported for Tomodachi Life: Living the Dream in [PR #385](https://github.com/seedds/nxnative/pull/385); that gameplay report has not been repeated here.
+  - The adjustable user clock (`time::AdjustableUserSystemClock::GetCurrentTime`, which the game's days follow) reads the time service's shared memory in the SDK (`MonotonicSystemClock::GetCurrentTime`, `sdk+0x4421cc`), which the host never maps, so it is the host's clock, as the user clock; `time::GetStandardSteadyClockCurrentTimePoint`, the free-function form of the steady clock ([Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) SDK 20.5.4, found in `main`'s imports before the first boot).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md).
+
+### The adjustable network clock aborts in `Adjust`
+
+- **Symptom:** `game called nn::diag abort: Result 0x74, call site sdk+…` within the first frames, the backtrace's first `sdk` frame right past `time::AdjustableNetworkSystemClock::Adjust` (its last instruction is the call of `diag::detail::AbortImpl`, so the return address names the next function, `GetSystemClockContext` of the same class). Any other reader of an adjustable network clock, or the adjustable user clock's `now()`, aborts in `diag::detail::AbortImpl` under `time::detail::MonotonicSystemClock`.
+- **Cause:** `Adjust` copies `StandardNetworkSystemClock::GetSystemClockContext` into the SDK's `detail::MonotonicSystemClock` and aborts on its failure; the SDK asks the time service, which the host never opens, and gets 0x74. Past that, every adjustable reader goes through `MonotonicSystemClock::IsAdjusted`, `GetCurrentTime` or `GetCurrentTimespec`, which turn the stored context into a time through the time service's shared memory, which the host never maps, and abort without it (Nintendo Switch Sports Resort's `sdk+0x5d96e0`..`+0x5d985c`). The adjustable network clock's `GetCurrentTime`, `now()` and `GetSystemClockContext` each call `IsAdjusted` first; the adjustable user clock's `now()` calls `GetCurrentTime`. `GetStandardNetworkSystemClockCurrentTimespec` (SDK 17) reads the shared memory too and returns 0x74.
+- **Fix:** on the host the network clock is the user clock ([Time zone rules, calendar conversion and the network clock](#time-zone-rules-calendar-conversion-and-the-network-clock)) and each adjustable clock is its standard clock, in every reader. `hle_time.c` answers `StandardNetworkSystemClock::GetSystemClockContext`, `AdjustableUserSystemClock::GetSystemClockContext` and `AdjustableNetworkSystemClock::GetSystemClockContext` with the user clock's context (the one the host's snapshots carry at `+0x00` and `+0x20`), `AdjustableNetworkSystemClock::GetCurrentTime` and the `now()` of both adjustable clocks with the host's clock, and both network `…CurrentTimespec` getters with the host's real time (`DM_FIXED_TIME` included). `Adjust` runs as is and only sets the SDK's copy. `t_time` checks each of them against a snapshot, the contexts within their 0x20 bytes.
+- **Found on:** METAL GEAR SOLID: Peace Walker - Master Collection Version (`0100C6F01C4F8000`, 1.3.1, SDK 19, not in the games table), program 1, which its launcher starts: it aborted in `Adjust` (`sdk+0x42c514` on that build) right after its first frames. Found and diagnosed by varyform in [PR #1875](https://github.com/seedds/nxnative/pull/1875), whose first fix (a zero network context) ran it on for 90 seconds (2100 frames) with sound on an M3 Max; the fix as landed has not been run on that game here (no game files).
+
+### A periodic benefit claim without the time service session
+
+- **Symptom:** `Break#1 reason=0 Result=0 svc at sdk+0x370f24` right after the first save at the title, with `bt: sdk+0x175f00 sdk+0x175fc4 sdk+0x176060 sdk+0x375b88 main+0x6ea74 …` (`diag::detail::OnAssertionFailure` called from `time::ClaimPeriodicBenefitWithUserSystemClock`).
+- **Cause:** the public `time::ClaimPeriodicBenefitWithUserSystemClock` (a once-a-day reward) asserts that `time::g_pStaticService`, the time service session `time::Initialize` opens, is set; the host takes over `Initialize` and opens none. The work is in `time::detail::ClaimPeriodicBenefitWithUserSystemClock`, which only compares the snapshots' fields through `CalculateSpanBetween` and `CalculateStandardUserSystemClockDifferenceByUser` (both host take-overs) and asks the service two things: when automatic correction was last switched, if the context's snapshot and this one differ in it (`+0xcc`), and the device's location and when it was set, if they differ in location name. Host snapshots never have automatic correction and always carry the host's zone name, but a claim context saved on a Switch (a location such as `Asia/Tokyo`) or a Mac whose zone changed reaches both, again with no session.
+- **Fix:** an `HLE_FORCE` on the public entry calls the SDK's `detail::` implementation directly (`hle_time.c`), and logs `time: periodic benefit claim → <result>`; past its session check the public entry does only that (SDK 6.5 and 20.5). The two service questions are taken over too: `detail::GetDeviceLocationNameAndUpdatedTime` answers the host's zone name, as its snapshots carry, and both it and `detail::GetStandardUserSystemClockAutomaticCorrectionUpdatedTime` answer a cleared time point. The host does not know either moment, and the claim uses such a time point only when its source ID is the current snapshot's steady clock's, which a cleared one never is.
+- **Found on:** Tetris 99 (010040600C5CE000) 2.5.0, SDK 6.4 (the same `sdk` module as [ASTRAL CHAIN](../../dm/games/01007300020FA000/README.md)), from a provisional profile: the claim returned 0, then 1 on the next check, and the title screen kept running for three minutes at about 56 fps.
+
+### Hooks whose return type did not match the SDK
+
+- **Symptom:** a call the host answers reads as failed when it succeeded, or reads leftover register bits. Super Smash Bros. Ultimate refills the Spirit Board at every visit, since the elapsed time between two snapshots never reads as known.
+- **Cause:** four take-overs declared another return type than the SDK's own function: `time::CalculateSpanBetween` returns bool (true when the span is stored), and the host returned a Result 0; `nifm::HandleNetworkRequestErrorResult` returns bool, and the host returned a Result whose low bit happened to be 0; `audio::AcquireAudioDeviceNotificationForOutput` and `pl::BeginVrMode` return a Result, and the host's were `void`. Checked in the `sdk` of SDK 12 to 20 (Metroid Dread `sdk+0x3ab540`, `+0x336210`, `+0x534a0`; Breath of the Wild `sdk+0x412970`).
+- **Fix:** each returns what the SDK does: the span call 1 or 0; the network call 0 (not resolved, offline); the notification 0 the first time and 0x499 (already acquired) after; `BeginVrMode` 0xd08e, the SDK's own answer when `pctl::CheckStereoVisionPermission` refuses, which the host now does too, having no VR display (Breath of the Wild's options then stay 2D, as MacNativeGames found). `t_time` checks the span call's values.
+- **Found on:** reported by MacNativeGames on [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (the Spirit Board) and Breath of the Wild 1.6.0 / 1.9.0 (the VR option); the Spirit Board was not replayed here.
+
+### `clock_gettime(CLOCK_REALTIME)` through the time source pointer
+
+- **Symptom:** `std::terminate` (`Break` from `sdk+0x5bfa48`) at the first real-time read (right after the first-boot dialog, `main+0x3f3f68` → `system_clock::now()`).
+- **Cause:** `clock_gettime(CLOCK_REALTIME)` calls through a source pointer (`sdk+0xb05010`) that `nntimeStartup` sets once `time::Initialize` succeeds: 1 = `nn::time::GetStandardUserSystemClockCurrentTimespec`, 2 = the adjustable clock's (`sdk+0x8e414`). Both asked the time service.
+- **Fix:** they are host take-overs now (`hle_time.c`), and `system_clock::now()` works on any build.
+- **Found on:** [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) (1.0.0.2, SDK 17.5.3).
+
+### Guest clock reads wait while the app is in the background
+
+- **Symptom:** after switching apps and back, one guest thread at 100% in a tight loop (`main+0x9abd0`, `x10 = 0`); the game freezes, picture still, sound on. Mac repro `DM_OE_SCRIPT=bg=1@20,bg=0@25`.
+- **Cause:** the frame pacing measured a frame period of 0 (`main+0x5926a8`: the clock difference between two frames). The host freezes the guest clock in the background but its threads went on, so two frames read the same time.
+- **Fix:** guest reads of the system counter (the `cntpct` gate, `svc GetSystemTick`) now wait while the app is in the background (`hle_os.c` `guest_clock_read_wait`); host work and the keyboard freeze ([The software keyboard blocks only its caller](#the-software-keyboard-blocks-only-its-caller)) keep the frozen clock.
+- **Found on:** [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md) (one of two causes; the other is [Focus handling mode decides whether focus changes are notified](#focus-handling-mode-decides-whether-focus-changes-are-notified)).
+
+### Cryptographically random bytes
+
+- **Symptom:** abort in `sm::Initialize` under `nn::crypto::GenerateCryptographicallyRandomBytes` (Unicorn Overlord: `std::random_device` → the `sdk`'s own `getentropy` → `InitializeCsrng`; Z-A: the first call in `nnMain`, `main+0x1734b4`).
+- **Cause:** the bytes come from the csrng service. The `sdk` defines `getentropy`, so the host's `getentropy` hook never sees the call, but the call into `nn::crypto` goes through the `sdk`'s PLT.
+- **Fix:** an `HLE_FORCE` on it fills from the host's entropy stream, the same stream as `getentropy` (`hle_os.c`).
+- **Found on:** [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (SDK 16.2.4; one boot), [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11; one boot).
+
+### `clock_gettime` is `nn::time`'s steady clock (SDK 22)
+
+- **Symptom:** `libc++abi: terminating due to uncaught exception of type std::__1::system_error` (the arguments came out as rubbish, the format named the failure) once the game's own code ran, with `sdk+0x5f2e60` (`std::terminate`) and `sdk+0x66ad2c`/`sdk+0x66acc8` (`get_terminate`/`terminate`) in the backtrace.
+- **Cause:** SDK 22's exported `clock_gettime` (`sdk+0xa1430`) accepts `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and returns `ENOTSUP` for ids 2–11; both accepted ids jump through musl ifunc slots in the SDK's data (`sdk+0xba5018`, `sdk+0xba5020`) whose `R_AARCH64_GLOB_DAT` relocations bind `nn::time::GetAdjustableUserSystemClockCurrentTimespec`, `_ZN2nn4time41GetStandardUserSystemClockCurrentTimespecEP8timespec` and **`_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec`** (`sdk+0xb92298`). The first two were answered from [the CLOCK_REALTIME entry](#clock_gettimeclock_realtime-through-the-time-source-pointer); the steady one was not, so the SDK's shared-memory client ran, could not read the time service's page, and returned an error, which `std::chrono::steady_clock::now()` (`sdk+0x5f2e10`: `mov w0,#1; bl clock_gettime; cbnz w0` → `std::__1::__throw_system_error`) turned into the exception.
+- **Fix:** `hle_time.c` answers `GetStandardSteadyClockCurrentTimespec` with the host's monotonic clock (`struct timespec` from `clock_gettime(CLOCK_MONOTONIC)`). The network-clock variants answer the host's real time, as the network clock is the user clock ([The adjustable network clock aborts in `Adjust`](#the-adjustable-network-clock-aborts-in-adjust)). To name such a failure, `hle_sdk16.c` takes `nn::diag::detail::VAbortImpl` (an assert, an uncaught C++ exception or an SDK check with a message): it logs `[diag] abort at <function>: <expression> (<file>:<line>) message format <format>` and then aborts as `AbortImpl` does. Only the format is printed: the host cannot expand a `va_list` the guest built.
+- **Check:** with `DM_AUDIO=1`, a run to the first room has no `[diag]` line and the frame counter keeps advancing.
+- **Found on:** [Well Dweller](../../dm/games/0100217023F6C000/README.md) (SDK 22.2.0), in `std::chrono::steady_clock::now()` called from GameMaker's frame-timing helper.
+
+## Modules and symbols
+
+### Host symbol indexes avoid repeated name scans
+
+- **Symptom:** relocation repeatedly scans all HLE and forced-takeover entries, and named-stub reuse becomes quadratic as more imports are missing.
+- **Cause:** module exports already had a name index, but `resolve_import`, `hle_implements`, `force_lookup` and stub reuse still searched their tables linearly.
+- **Fix:** open-addressed name indexes store entry numbers. HLE duplicates retain the first entry; forced-takeover duplicates still abort. Stub insertion grows its index above half capacity and retains existing stub numbers. Resolution is serialized at startup and by the module write lock during runtime NRO loading; module string tables stay mapped across unload.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game), reported in [PR #261](https://github.com/seedds/nxnative/pull/261).
+- **Check:** `make -C dm/host/tests GAME=010015100B514000 symbols nro` covers collisions that wrap around the table, duplicate precedence/rejection, absent sections and names, counting-wrapper selection, all 4,096 stubs through growth and reuse at capacity, and NRO relocation/lifecycle. The symbol test also passes AddressSanitizer and UBSan. A local arm64 Mac synthetic 270-entry HLE table with 25% misses, Apple clang 21 at `-O1`, took 375–442 ns per linear lookup versus 15 ns indexed (25–29x; three runs of 360,000 lookups). This measures lookup cost, not overall game loading time; no new gameplay run here.
+
+### Global symbol resolution in load order
+
+- **Symptom:** a library's `free` rejects a pointer (`CentralHeap::Free` → `NotNMallocPtrError`).
+- **Cause:** the game's `main` defines its own `operator new` / `delete` (Unity's memory manager) and `sdk` has a copy forwarding to `malloc` / `free`.
+- **Fix:** symbols are resolved globally in load order (the first module's definition wins, also for a module's references to its own exports); only local / non-default-visibility symbols bind to the module itself (`loader.c`). The loader logs how many references bind to an earlier module.
+
+### Undefined weak imports bind to 0
+
+- **Symptom:** a weakly imported function the game calls although nothing defines it: an `UNIMPL` line, then an abort.
+- **Cause:** the loader bound every undefined import to a named stub, so the address test the compiler emits for a weak symbol saw a function.
+- **Fix:** an undefined weak symbol that no module defines and the host does not implement is now 0, as Horizon's rtld binds it (`loader.c`, logged as `undefined weak … bound to 0`).
+- **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (the `thread_local` init function `_ZTHN13LowLevelTasks5FTask10ActiveTaskE`).
+
+### `nn::ro` and its port
+
+- **Symptom:** crash in `nn::ro::InitializeWithPortName`.
+- **Cause:** `nn::ro` connects to `ldr:ro`.
+- **Fix:** take over `Initialize` and answer `LookupSymbol` from the loaded modules (`hle_ro.c`). Check the mangled names against the new title's imports: SDK 19's `LoadModule` takes one more bool (`_ZN2nn2ro10LoadModuleEPNS0_6ModuleEPKvPvmib`), so the hook for the older form did not catch it and the SDK's own code would have run.
+- **Found on:** [Hades II](../../dm/games/0100A00019DE0000/README.md) (SDK 19's `LoadModule`).
+
+### `ro::ProtectRelro` runs natively
+
+- `nn::ro::ProtectRelro` (called from `main`'s DSO init), a new import of SDK 20, needs nothing: it runs natively on the host's no-op `SetMemoryPermission` / `SetMemoryAttribute`. Found on [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, SDK 20.5.22).
+
+### Loading NROs with `ro::LoadModule`
+
+- **Symptom:** the frame loop runs, but the game waits for code it loads itself (`ro::RegisterModuleInfo` / `ro::GetBufferSize` red lines; `main` imports 1,045 `lua2cpp::create_agent_*` functions, global, that no ExeFS module defines, bound to stubs at start).
+- **Cause:** the fighters' code is 98 NROs inside `data.arc`, registered by `.nrr/cross2_*.nrr`. The SDK's own `LoadModule` (SDK 8.2.1 `LoadModuleInternal`, `sdk+0x347460`) uses the service only to map the image, then zeroes bss, relocates through rtld's module lists, calls the module's init and binds the variables of the modules loaded before; the host replaces rtld, so it takes over the whole call.
+- **Fix:** the NROs are collected at pack time by the SHA-256s the NRRs list (`dm/tools/nro_collect.py`: loose files, the current files of an indexed archive, or a scan for stored and zstd-framed NROs; Smash's NRRs of older releases also register 666 superseded copies, which `data.arc` still holds and which are left out), rewritten like any module (`patch_nso.py` reads NROs: the flat image, segments at +0x20, build ID at +0x40) and listed in `<patched dir>/nro.tsv`. The host maps them all at start and keeps them out of symbol lookups; `LoadModule` finds one by the image's SHA-256, restores its data and bss (after the first load), relocates it against the modules loaded then in load order, binds the earlier modules' symbol relocations it defines (main's `lua2cpp` stubs), fills `nn::ro::Module` as the SDK does (+0 module, +8 state 1, +0x10 image, +0x18 buffer) and calls its `DT_INIT`; `UnloadModule` calls `DT_FINI` and binds every relocation that pointed into it again (`loader.c` "NRO modules", `hle_ro.c`). `GetBufferSize` returns the bss size from header +0x38 as the SDK does. The startup init pass must skip NROs (their init ran unrelocated and crashed). Only data is written at a load, so it works with code embedded in the iOS executable: `gen_embed.py` packs the NROs into three sections (`__dm_nro_x0`, `__DM_NRO_W`, `__dm_nro_x1`) and a table of their pieces (`__dm_nro_tab`), since a Mach-O file has at most 255 sections and three per NRO would pass it, and `map_image` maps an NRO from there (`loader.c` `nro_pieces`).
+- **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (13.0.5): it loads six NROs in its first 30 s and calls none of the stubs. Played on an iPhone.
+
+### NRO tables sized from the manifest and snapshots taken on demand
+
+- **Symptom:** `FATAL .../nro.tsv: more NROs than module slots (MAX_MOD 128)` before `nnMain` (GitHub issue [#372](https://github.com/seedds/nxnative/issues/372)); after increasing the capacity, startup eagerly copies several GB of inactive NRO data and bss.
+- **Cause:** the host used fixed 128-entry module and activation tables. It also allocated and copied every NRO's full writable image at startup so reload could restore it, including initially zero bss.
+- **Fix:** count the manifest once before loading and allocate both tables at their final size, preserving every `module_t` address. Keep each NRO's initialized data only when it is first loaded, before relocation and initialization. Reload restores that data and zeroes bss; unused NROs need no snapshot. The original NRO header supplies the initialized data size.
+- **Found on:** [FINAL FANTASY X/X-2 HD Remaster](../../dm/games/0100BC300CB48000/README.md), 1,432 NROs plus three initial modules; 5,836 MB of writable data and bss versus 767 MB of initialized data across all NROs. Most effect modules stay inactive on a short route.
+- **Check:** `make -C dm/host/tests GAME=01007BB017812000 nro` exercises manifest sizing, the last slot of a 1,435-slot table, load order, initialized-data restoration and zeroed bss after reload.
+
+### Online SDKs in NROs are never loaded
+
+- **Symptom:** `[EOS] Failed to create platform` (the game plays offline); `refused …: an online SDK (Epic Online Services), not loaded`; `refused an NRR that registers only online SDKs (1 hashes)`.
+- **Cause:** Epic Online Services in an NRO (`rom:/nro/EOSSDK-Switch-Shipping.nro`, loaded with `ro::LoadModule`; `main` imports the `EOS_*` functions). Before the host loaded NROs, the imports stayed `UNIMPL` stubs and `EOS_Platform_Create` handed back a garbage handle; the game checks it and plays offline.
+- **Fix:** the host now loads NROs ([Loading NROs with `ro::LoadModule`](#loading-nros-with-roloadmodule)), but never an online SDK, whatever the game: an NRO that exports `EOS_Platform_Create` is left out of the pack (`dm/tools/nro_collect.py` `ONLINE_SDKS`, a `refused` row in `nro.tsv`) and `ro::LoadModule` refuses it with one log line (`refused …: an online SDK (Epic Online Services), not loaded`), also by the export when an older `nro.tsv` has it. An NRR that registers only such modules fails `RegisterModuleInfo`, as every registration did before the host loaded NROs, so the game takes the path it took then. So both games behave as before: offline, local saves.
+- **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (SDK 18.3.2, one boot each); [Hades](../../dm/games/0100535012974000/README.md): it never asks for the module (checked on 1.0.38233: `refused an NRR that registers only online SDKs (1 hashes)`, no `LoadModule`, its frames as before). Hades' `main` imports only EOS Auth, Connect and PlayerDataStorage, Epic-account cross-save the host cannot serve; the real SDK would at best fail its login and at worst wait on time-outs or contact Epic's servers, with an unknown risk to the player's account.
+- **Note:** open question for the maintainer: always load, refuse online SDKs (as now), or decide per profile.
+
+### The game's code packed into `main` by a boot stub
+
+- **Symptom:** `ro::LoadModule` of an NRO that no RomFS file holds: `[RED] … not in the patched modules' nro.tsv`, and `nro_collect.py` reports the registered hash not found (before it read version 1 NRRs: `no NRR file with hashes`).
+- **Cause:** [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md)'s `main` is a boot stub. Six threads each decode one part of the game's code, a 24.7 MB NRO, out of `main`'s data segment. Each part is a stream read backwards, every byte unscrambled against the byte read before it and a key that grows per byte (the last part also against an MT19937 stream), then Camelot's LZ (the CRA archive's). The stub registers the RomFS's NRR and loads the result with `nn::ro`. That NRR is version 1 (byte +5): its header is 0x180 longer, so the hash table's offset and count are at +0x4c0, not +0x340.
+- **Fix:** `dm/tools/boot_nro.py` decodes the parts offline, for the builds it lists (`BUILDS`, by `main`'s build ID: the table of stream ends is a fixed address). `nro_collect.py` reads the modules of the ExeFS beside the RomFS (a dump's `exefs`, an extraction's `ExeFS`, a `.nup` package's) and keeps a decoded NRO, like any other, only when an NRR registers its SHA-256; it reads version 1 NRRs as `hle_ro.c` does. No run of the game is needed (nxnative's Mac host captures the NRO from a run of the game instead; that capture is not ported).
+- **Android pack:** `scripts/pack_android.py` collects the NROs this way into `<title ID>-work/android-nro/`, rewrites them with the modules and lists them in the pack's `nro.tsv` ([Pack a game](../../android/README.md#pack-a-game)); its shader split gets that folder as `DM_NRO_DIR`. The phone's Prepare collects them too.
+- **Check:** `dm/tools/tests/test_boot_nro.py` (synthetic streams made by the inverse of the format, both NRR versions, a boot-stub NRO beside a RomFS). On 1.1.1 `nro_collect.py` finds the NRO in 3.5 s, from the extraction and from the `.nup` package: the SHA-256 the NRR registers, the same bytes nxnative captured.
+- **Found on:** [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md) (1.1.1).
+
+### GPU driver modules that are never loaded
+
+- **Symptom:** `main` imports EGL (SDL3's GL support) and `vkGetInstanceProcAddr` (its Vulkan support), but the game renders with NVN (`FNA3D_Driver_NVN.cpp`).
+- **Cause:** NVIDIA's OpenGL and Vulkan drivers (`subsdk1`, `subsdk0`) program the GPU through NvRm, which the host does not have.
+- **Fix:** they are never loaded (`profile_guess.py` `GPU_DRIVERS`); the EGL imports stay unbound stubs that nothing calls.
+- **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (FNA3D).
+
+### Modules only the NROs import from
+
+- **Symptom:** `UNIMPL _ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_`, `UNIMPL glslcInitialize`, then `UNIMPL _ZN5movie9ExtractorC1ENS_13ContainerTypeE` and a crash reading address 0x18 in an NRO (`pc=nro18+0x97f4`) as the first movie starts.
+- **Cause:** the provisional profile loads a subsdk only when `main` imports something from it that the host does not supply. The survey extracts only the code modules, so the NROs in the RomFS were not looked at. Portal's `main` is a launcher with SDL; its Source engine NROs play the movies through NintendoSDK_movie (`subsdk2`, imported by `video_nx.nro`) and initialize and call GLSLC (`subsdk0`, imported by `materialsystem.nro` and `video_nx.nro`). Left out, their imports were bound to stubs, and the stub constructor of `movie::Extractor` left the object empty.
+- **Fix:** once the rewrite stage has collected the NROs, the NSP script adds to a provisional profile every subsdk whose exports an NRO imports and that no loaded module, other NRO or host hook supplies (`profile_guess.py` `nro_modules`, written under a section `After the NRO collection`). NVIDIA's GPU drivers stay out, as above.
+- **Found on:** [Portal](../../dm/games/01007BB017812000/README.md) (`modules main subsdk0 subsdk2 sdk`; `subsdk1`, NVIDIA's OpenGL driver, stays out).
+
+### `ro::LookupModuleSymbol` for a name the module does not define
+
+- **Symptom:** `[RED] ro::LookupModuleSymbol BuiltDebug: not defined in that module` once at boot; nothing goes wrong after it.
+- **Cause:** the Source engine asks each module it loads for `BuiltDebug`, which only its debug builds define. `ldr:ro` fails such a lookup on Horizon too, and the game takes the failure as "release build".
+- **Fix:** the host's answer was already Horizon's (a failure result). The line is no longer red when the module is a loaded one; a lookup in a module the host does not know stays red (`hle_ro.c`).
+- **Found on:** [Portal](../../dm/games/01007BB017812000/README.md).
+
+### IL2CPP common string table intact
+
+- Not needed in the end: the tolerant common string table of pull request #15. [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) 1.0.0.2's `main` has the table intact at `main+0x46169ac`, 109 entries ending at `Hash128`.
+
+### Code inherited from another title at fixed addresses
+
+- **Symptom:** harmless on the build it was written for, silent memory corruption on any other.
+- **Cause:** code that calls fixed module addresses. d2r-mobile's 3D render scale read a renderer pointer at `main+0x31e0848` and called `main+0x8582f0`; in Mario v0 that is the middle of a static initializer and only did nothing because the pointer happened to read 0.
+- **Fix:** such code checks `module_t.build_id` now (written into `fixups.tsv` by the rewriter) and stays off on other builds.
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (v0, code inherited from d2r-mobile).
+
+### Built-in fonts and the audio device notification of SDK 21
+
+- **Symptom:** an abort connecting to `pl:u` at boot; a failed `nn::audio` call at boot.
+- **Cause:** SDK 21 has new names: `nn::pl::GetBuiltInFontData` (a Switch 1 and a Switch 2 overload, each filling type, address and size, and returning whether the font is loaded) and `nn::audio::AcquireAudioOutputDeviceNotification`. Unhooked, they reach the services the host does not have.
+- **Fix:** both hooked (`hle_sdk16.c`, `hle_audren.c`), with the same stand-in fonts and the same never-signaled event as their older names. The batch form `nn::pl::GetBuiltInFontDataSet` (count, entries, an array of type bytes and their number) is hooked too, both overloads: Switch 2 types (at most 6, `*count` written whatever the answer) and Switch 1 types (at most 7, `*count` written only when the fonts are loaded; Splatoon Raiders' `sdk+0x59a720`, from upstream nxnative PR #2548): one entry per font in the order asked, with the same fill, a type with no stand-in font left out, and whether any is loaded. Unhooked, it aborts with result 0xe15 at `sdk+0x4fd4a4` after the `[RED]` line about `pl:u`. `GetBuiltInFontData` gives the plain TTF, past the 8-byte BFTTF header, as `GetSharedFont` does: the service's offsets point past the header, whatever `font_skip()` (the older `GetSharedFontAddress` convention) decides for the game's main. It first followed `font_skip()`, which gives a main that imports `ScalableFontEngineHelper::Decode` the header (nxnative PR #1639 made the change for the Switch 2 Edition of Super Mario Bros. Wonder). Of the programs on hand (2026-11-14, a scan of the packs' main and sdk images) two mains call it, both importing `Decode`: that program and Splatoon Raiders; Kirby and the Forgotten Land's Switch 2 Edition takes its fonts through `GetBuiltInFontDataSet`, whose only shared-font text is its Yes/No system window (`Builtin_S.bfcpx`); that window with the TTF is not yet checked on the phone (open). Donkey Kong Bananza, Mario Kart World, Kirby and the Forgotten Land, and Super Mario Bros. Wonder's program 0 read their fonts through `GetSharedFontAddress`, which this does not change. Breath of the Wild and Tears of the Kingdom are not on hand: whether their mains call `GetBuiltInFontData` is not checked.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md) (upstream nxnative, c8521eeb); [Super Mario Bros. Wonder - Nintendo Switch 2 Edition](../../dm/games/040015100B514001/README.md) (the TTF past the header); [Kirby and the Forgotten Land - Nintendo Switch 2 Edition](../../dm/games/04004D300C5AE001/README.md) (SDK 19.3.7: `GetBuiltInFontDataSet`, from `main+0x65b534`, which retries every 100 ms until the fonts are loaded).
+
+### No stand-in shared font on Android
+
+- **Symptom:** (Android) `[RED] cannot open the standard shared font` at boot, then a crash in the game's font code (Splatoon Raiders: `CRASH sig=11 addr=0x66637300000100 pc=main+0x8109d8`).
+- **Cause:** the standard shared font falls back to the system's own font when neither `DM_SHARED_FONT` nor `DM_FONT_DIR/standard.ttf` is set, and that fallback was macOS's Arial Unicode only. On the phone nothing opened, so SDK 21's `GetBuiltInFontData` filled no record, and the game, which on the console always has its fonts, used the record anyway.
+- **Fix:** `hle_sdk16.c` `SYSTEM_FONT`: Android's `/system/fonts/Roboto-Regular.ttf`, which every Android has (Latin, Greek, Cyrillic). The CJK fonts there are `.ttc` collections, not one TTF, so Chinese and Korean system text has no glyphs yet (open). The Nintendo extension font (`nintendo_ext.ttf`, button icons) was missing on the phone, so those icons drew as `?`: resolved, [Button icons drawn as "?" on Android](#button-icons-drawn-as--on-android).
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md) on the phone (Turnip): boots past the font with it, as with `DM_SHARED_FONT=/system/fonts/Roboto-Regular.ttf`.
+- **Check:** `make -C dm/host/tests GAME=<id> build/t_shared_font && dm/host/tests/build/t_shared_font`.
+
+### Button icons drawn as "?" on Android
+
+- **Symptom:** (Android) button icons in game text show as `?` ("Press ? + ? to start" on Super Mario Bros. Wonder's title screen); the log has `[YELLOW] Nintendo extended shared font missing (dm/tools/make_ext_font.py generates nintendo_ext.ttf)`.
+- **Cause:** the icons are glyphs of shared-font type 5, the Nintendo extension, at private-use code points (U+E0E0 = A button). The host serves `make_ext_font.py`'s stand-in for it (`DM_SHARED_FONT_EXT`, or `DM_FONT_DIR/nintendo_ext.ttf`), which the iOS and Mac apps ship; the APK had none, and the script's letters came from a macOS font only.
+- **Fix:** the APK build makes it (`android/app/build.gradle` `nxExtFont`: `make_ext_font.py` into the assets, no font file in the sources; it needs fontTools, now in `android/environment.yml`, and is tried again at the next build when it could not be made), `GameActivity` places it with `GameFonts` as `nintendo_ext.ttf` in the same `DM_FONT_DIR` folder as the bundled `standard.ttf`. Its letters come from that bundled Noto Sans (`dm/third_party/fonts`, SIL OFL), which the build passes to `make_ext_font.py`, so the APK ships no system font's glyphs; it is also the script's default when macOS's Arial Rounded Bold is not there (`LETTER_FONTS`).
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) on the AYN Thor (2026-11-13).
+
+### The system window's text missing with Android's variable Roboto
+
+- **Symptom:** (Android) text in one kind of window does not show while the rest of the game's text does: Splatoon Raiders' Yes / No window. The log has `shared font (standard.ttf): /system/fonts/Roboto-Regular.ttf`.
+- **Cause (probable):** the window's layout (`Layout/Cmn_SystemWindow_00`) sets its text in `Builtin_S.bfcpx`, whose only font is `nintendo_udsg-r_std_003.bfttf`: the standard shared font, which the host serves from a stand-in. The game's other text uses its own fonts (`Font/*.bfarc`: `SpMain`, `SpTreasureBold`, ...). Since Android 12 `/system/fonts/Roboto-Regular.ttf` is a variable font (`fvar`, `gvar`, `avar`, `HVAR`, `STAT`; no `kern`), the only shared font in use that is one, and nn::fontll may not draw it. Not yet confirmed: no log of the window with a static font.
+- **Fix (resolved 2026-11-08):** `SYSTEM_FONT` on Android is a list, `/system/fonts/RobotoStatic-Regular.ttf` (static, Android 13 and later; 305 KB on the Honor's Android 17) before `Roboto-Regular.ttf`; `font_first` takes the first that opens and says in its log line when the font is variable. `h_font_LoadFont` logs once `[RED] shared font: ScalableFontEngine::LoadFont(<name>) of the host's stand-in returned <code>` when the engine refuses the stand-in. `DM_SHARED_FONT=/system/fonts/Roboto-Regular.ttf` gives the old font back for a comparison. On the phone (the v0.2.0 release candidate, shader library `v-0035e16073bf`) the Yes / No text shows correctly; no log was read to confirm that RobotoStatic was the font opened, and the old font was not tried again, so the cause stays probable.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md#found-on-this-game) (reported by the user on the Honor, Android 17).
+- **Check:** `t_shared_font` (the list, the first font that opens, the `fvar` test).
+
+### Shared fonts depend on the phone's fonts (one Roboto for six types)
+
+- **Symptom:** (Android) text drawn through the shared fonts is missing or only partly there: Chinese, Japanese-in-Chinese-type and Korean strings show nothing but their Latin letters, button icons (U+E0E0...) show the notdef box, and what is drawn differs from phone to phone. [#223](https://git.eden-emu.dev/moceure/BananaNative/issues/223) (Splatoon Raiders and Star Fox, text missing or garbage; no log, so the font as the cause is probable, not confirmed).
+- **Cause:** the earlier stand-ins ("No stand-in shared font on Android", "The system window's text missing with Android's variable Roboto") served the phone's own `/system/fonts/RobotoStatic-Regular.ttf` or `Roboto-Regular.ttf` for all six types. Roboto has Latin, Greek and Cyrillic only, so types 1-4 (Chinese, Korean) had no glyphs; type 5 (the Nintendo extension, button icons) had no icon font and used the same Roboto; and the file depends on the ROM (static or variable, present or not).
+- **Fix:** the APK carries Noto Sans Regular (SIL OFL 1.1, subset to Latin, Greek, Cyrillic, with symbols merged in from Noto Sans Math and Symbols 2 since [A game crashes on a glyph the standard shared font lacks](#a-game-crashes-on-a-glyph-the-standard-shared-font-lacks), `dm/third_party/fonts`); the launcher copies it to `<files>/fonts/standard.ttf` and sets `DM_FONT_DIR` (`GameFonts.java`; a `DM_FONT_DIR` line of the player's wins). The host (`hle_sdk16.c` `font_resolve`) picks per type: 0: `DM_SHARED_FONT`, `$DM_FONT_DIR/standard.ttf`, the system's Roboto last. 1-4: `DM_SHARED_FONT` if set, else `$DM_FONT_DIR/cjk_sc.ttf` (1, 2), `cjk_tc.ttf` (3), `cjk_kr.ttf` (4), else a phone font that is a plain TrueType file (`NotoSansSC-Regular.ttf`, `DroidSansFallback.ttf`, ...), else the standard font. 5: `DM_SHARED_FONT_EXT`, `$DM_FONT_DIR/nintendo_ext.ttf`, else the standard font (the icons stay the notdef box; a self-drawn icon font is a follow-up). Every candidate except the `DM_SHARED_FONT*` switches must pass `font_unusable`: an sfnt header, not `ttcf` (a collection) and not `OTTO` (CFF outlines), and `head`, `cmap`, `glyf`, `loca`, `maxp` inside the file. A `.ttc` is deliberately not unpacked: Android's stock CJK collection holds CFF faces, which the check rejects anyway, and the SDK's font engine is not known to take CFF. One log line per type: `shared font type <n> (<name>): <file>, <bytes> bytes`; `[RED]` only when no standard font is usable. CJK glyphs themselves still need a `cjk_*.ttf` (a download is a design note only: `internal/2026-11-13-issue-triage/font-cjk-download.md`).
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md#found-on-this-game) and [Star Fox](../../dm/games/0400E88025B1A000/README.md#found-on-this-game) (issue #223); every game that reads the shared fonts. Phone check open.
+- **Check:** `t_shared_font` (the order per type, the BFTTF header and sizes, `font_unusable`), `test_android_gamefonts.py`.
+
+### A game crashes on a glyph the standard shared font lacks
+
+- **Symptom:** (Android) a crash in the game's own font code soon after the shared fonts are logged, before the first frame: Echoes of Wisdom `CRASH sig=11 addr=0x38 pc=main+0x8b37c`, the line before it `shared font type 5 (NintendoExtension): ...`; a register holds the character asked for (`x1=0x25a1`).
+- **Cause:** the code at `main+0x8b37c` asks its font for the glyph of U+25A1 (WHITE SQUARE; `bl 0x8f1f8` with `w1` = the character from its font object's `+0x34`) and sets a flag in the result (`ldrb w8, [x0, #0x38]`) without a NULL check: the console's standard font has the glyph, so the game never meets a missing one. The APK's stand-in (`dm/third_party/fonts`) was a subset of Noto Sans, which has one glyph in Geometric Shapes (U+25CC) and none in Arrows, Mathematical Operators, Miscellaneous Symbols or Dingbats, although the subset asked for those blocks: `pyftsubset` leaves out what the font does not have. The Mac serves Arial Unicode, which has the glyph, so the game ran there.
+- **Fix:** the stand-in is Noto Sans with the code points it lacks merged in from Noto Sans Math (arrows, operators) and Noto Sans Symbols 2 (all 96 geometric shapes, most miscellaneous symbols and dingbats), all three SIL OFL 1.1 from the Noto Project with no Reserved Font Name; `dm/tools/make_std_font.py` builds it reproducibly, Noto Sans's own glyphs, hinting and line metrics unchanged (`dm/third_party/fonts/README.md`). The line metrics matter: a plain merge takes the extremes of the three fonts, and with Noto Sans Math's win ascent / descent (3105 / 2550) the font engine drew all shared-font text squashed (Mario Kart 8 Deluxe's quit dialog, on the first build of the merged font). `test_android_gamefonts.py` checks that U+25A1 and the other symbol blocks have glyphs and that the line metrics are Noto Sans's.
+- **Found on:** [Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md#found-on-this-game) 1.1.0 on the AYN Thor (2026-11-16).
+- **Check:** `test_android_gamefonts.py`; on the phone, `DM_SHARED_FONT=<the new font>` in `env.txt` tries a font without a new APK.
+
+### The Joy-Con mouse pointer
+
+- **Symptom:** `[RED] sf: the game connects to service hid itself, which the host does not serve`, then `game called nn::diag abort: Result 0xe15` in `sdk`, at boot of a Switch 2 game that sets up the Joy-Con's mouse mode.
+- **Cause:** `InitializeJcms` and `InitializeNmouse` open the hid service themselves, and the host has neither the service nor the sensor.
+- **Fix:** the Jcms and Nmouse calls are hooked (`hle_hid.c`): no handles, a merged handle with no states, and the pointer's settings (`SetNmousePointerRanges`, `EnableNmousePointer`, `SetNmousePointerPosition`) with nothing to set. From upstream nxnative (0a759de7, 03d92a9f), with the pointer settings added here.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0, on the phone, right after its graphics system came up; upstream: Fire Emblem Fortune's Weave, Pokémon Pokopia.
+
+### The Joy-Con mouse sensor's newest state
+
+- **Symptom:** `CRASH sig=11 addr=0x18` in `sdk`, in `nn::hid::detail::GetJcmsStates` (`sdk+0x659990` in the SDK 20.5.29 `sdk` module), right after `hid: controllers reported from now on (the game set its supported styles)`.
+- **Cause:** `hid::GetJcmsState` (one state, not the `GetJcmsStates` ring) was not hooked. The SDK's own reads the hid service's shared ring through a table pointer that `InitializeJcms` would have set; the host hooks `InitializeJcms` and maps no such memory, so the pointer is null.
+- **Fix:** `hid::GetJcmsState` is hooked (`hle_hid.c`): a cleared 32-byte state (sampling number 0, no movement, attributes 0: not connected), as there is no sensor on the host. From upstream nxnative's pull request #1425.
+- **Found on:** [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md) v262144, on the phone, its first frame after boot.
+
+### Switch 2 SDK hid calls that open the hid service themselves
+
+- **Symptom:** `[RED] sf: the game connects to service hid itself, which the host does not serve`, then `game called nn::diag abort: Result 0xe15` with the call site in `sdk` (`FATAL game aborted`); for some calls a null read in `sdk` instead. Nintendo Switch 2 Welcome Tour: `sdk+0x65cfdc`, `nn::hid::GetMousePointerSpeedScale`, 3.5 s after boot.
+- **Cause:** the SDK's own code for these calls connects to the hid service (or reads its shared memory, or calls through its null session), which the host does not serve. Upstream nxnative hooks 24 of them that this host did not: the mouse pointer speed setting; the Joy-Con mouse pointer's ranges, area, restriction, USB mouse handle and button setup, `GetNmouseState` and `GetNpadIdType`, and `InitializeNmouse` with a pointer type; the npad IMU (`Enable` / `Disable` / `IsNpadImuEnabled`, `GetNpadImuSamples`) and the sensor fusion's IC information, newly-assigned flag and calibration parameter; the Joy-Con icon decoration colour; the Home button protection; `ShowControllerStrapGuide` with an argument; `InitializeGesture` with two arguments.
+- **Fix:** all 24 are hooked (`hle_hid.c`), with upstream's answers: the speed scale is 1.0; the merged pointer handle 0 takes the pointer settings and has no state or controller (no device: nothing on Android reports a Joy-Con mouse sensor); the IMU state is kept by the host and `GetNpadImuSamples` writes the newest 5 ms ticks (at most 16, oldest first) of the host's six-axis state as acceleration in m/s^2 and angular velocity in rad/s, with upstream's small per-tick noise (the SDK's fusion never calibrates on samples that never change; `DM_IMU_NOISE`, `DM_IMU_ACC_SIGN`, `DM_IMU_GYRO_SIGN`); the IC information is 2000 deg/s and 8 G; a calibration parameter is what the game stored this run, else a zero bias for the host's own sensor, else none for a live controller. Upstream feeds the pointer and IMU calls from a live Joy-Con 2 transport this host does not have, so the IMU samples hold a live controller's newest sample for every tick (with a tenth of the noise as a dither) instead of interpolating a history.
+- **Found on:** [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md) v262144, on the phone (`GetMousePointerSpeedScale`; `main` also imports `GetNmouseState`).
+
+### A Nintendo application's scene id
+
+- **Symptom:** a null read in the hid client under `nn::hid::SetSceneIdForPrivateApp` as a scene starts.
+- **Cause:** Nintendo's own applications call `SetSceneIdForPrivateApp` at each scene's start, and the SDK's own connects to the hid service, which the host does not have.
+- **Fix:** it is logged, as nothing reads it (`hle_hid.c`; upstream nxnative's pull request #1425, b0f14c1a).
+- **Found on:** [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md): its scene modules.
+
+### GameShare guest displays
+
+- **Symptom:** a crash at boot in `nn::vi` under `nn::streamplay::CreateIndividualDisplays`.
+- **Cause:** a game can create its guest displays at boot, before any session, and the call starts a second display service the host does not have.
+- **Fix:** `CreateIndividualDisplays`, `DestroyIndividualDisplays` and `GetNativeWindowHandle` answer that there is no guest (`hle_misc.c`; upstream seedds/nxnative 03d92a9f).
+- **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md).
+
+### GameChat at boot
+
+- **Symptom:** `[RED] sf: the game connects to service chat:u itself, which the host does not serve`, then `game called nn::diag abort: Result 0xe15` under `nn::chat::Initialize`; with `Initialize` taken over, a null read or an abort in another `nn::chat` call (`sdk+0x6bc148`, `sdk+0x6bf2c8`).
+- **Cause:** a Switch 2 game can initialize GameChat at boot. The SDK's `Initialize` opens `chat:u`, and its other calls go through the service object that `Initialize` makes.
+- **Fix:** `nn::chat::Initialize` (ready, no chat), `IsChatting` (no) and `SetScreenSharingMode` (nobody to share with) are hooked (`hle_misc.c`), and `AttachToRoomInfoChangedEvent` (bound, never signalled), `SetSharingKey` and `ClearSharingKey` (nothing to share). Another GameChat call a game imports needs a hook of its own: unhooked, it reads the service object `Initialize` would have made (Mario Kart World 1.8.0: a null read at `sdk+0x6bc148` in `AttachToRoomInfoChangedEvent`). Every GameChat call Mario Kart World 1.8.0 imports is hooked now, as one state: no room (`GetRoomInfo`: no members), applets that close at once, and no camera. Its camera storage is set up at boot whatever the chat state, and each picture becomes a texture (an `nn::gs::NativeImageHandle` through `nvnNativeImage`; it aborts if one fails); the SDK's own `CalculateLocalCameraVideoBufferSize` aborted first (`sdk+0x6bf2c8`), because the taken-over `Initialize` never counts GameChat initialized. The host sizes the storage for its own layout (linear RGBA8, 256-byte rows, each picture 4 KiB aligned), keeps the pictures black in the game's buffer, makes the textures over them (`dm_chat_camera_image`, read by the native images of `hle_nvn.c`, from upstream's Fire Emblem Fortune's Weave work), and answers `RequestNext*CameraImage` with a sync handle that never signals (`DM_SYNC_NEVER`, which `nn::gs::TryWaitNativeSync` reads as not reached): no picture ever comes, so nothing shows.
+- **Found on:** Hyrule Warriors: Age of Imprisonment (upstream nxnative, d70ee900; its profile is not on this branch); [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 on the phone.
+
+### GameChat queries from the title screen (SDK 21)
+
+- **Symptom:** `CRASH sig=11 addr=0 pc=sdk+0x6be4d4` in `nn::chat::GetChattingUid()`, from the game's title screen code.
+- **Cause:** SDK 21 games ask the chat library who is chatting, for the room, the sharing key, the virtual camera, the members' audio levels and the camera streams; the SDK's versions read the service object `Initialize` would have made.
+- **Fix:** hooked as "no chat" (`hle_misc.c`): a zero Uid, `GetRoomInfo` fails (with `RES_FAIL`, the chat library's real result not being known), the sharing and virtual camera calls succeed and keep nothing, the camera streaming calls succeed and stream nothing, the next-image requests fail, no audio levels.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md): 33 `nn::chat` imports.
+
+### The camera library's context and the graphics system check
+
+- **Symptom:** at boot, `game called nn::diag abort` at `sdk+0x46e8b8` in `nn::gs::sdk::CheckGraphicsSystemInitialized`; with that answered, an abort on Result `0x30af3` from `nn::camera::sdk::CreateCameraContext`.
+- **Cause:** a Switch 2 game can link the camera library into its own `main` and initialize it at boot whether or not a camera is there. `nn::camera::Initialize` first checks the sdk's graphics-system flag, which only `BootGraphicsSystem` sets, inside the driver's `nv::InitializeGraphics` that the host takes over. It then asks the sdk for a context, a session through the graphics server's user session, which the host does not have.
+- **Fix:** `CheckGraphicsSystemInitialized` is answered from the host's record of `nv::InitializeGraphics` (`dm/gfx/hle_nv.c`). `CreateCameraContext` hands out a host session (`hle_misc.c`, `dm_sf_host_session` in `hle_sf.c`) on which every request succeeds with zeroed output. This is a stub, not a camera: zeroed answers read as no camera (command 3 "Default" gives context 0). Open: the context is closed through `svcCloseHandle`, which ignores host session handles, so its slot stays taken (one context per boot so far).
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 on the phone (`nn::camera::Initialize` at `main+0xcdebc0`).
+
+### The camera commands of SDK 21's own camera module
+
+- **Symptom:** with the camera session answering 0xdc4 to every command, Star Fox logs `This platform does not support the camera function.` (its `vwebcam.switch2.cpp:997`) and dereferences a null on the way out (`main+0xba54e4c`); with 0x7c4 to every command its module aborts in `Initialize` (subsdk3+0x1ef4) or `Finalize` (subsdk3+0x200c).
+- **Cause:** the game ships its own camera module (`subsdk3`, `nn::camera`) and sorts the results itself. `Initialize` sends command 3 with the device name `Default` and takes success or 0xdc4, the latter passed to the game as "no camera support", a path a console with a camera port never takes; `QueryDeviceConnection` (command 29, a DeviceRequest) reads 0x7c4 as `No camera device detected.`; `Finalize` sends command 4 and aborts on any failure; the connection event is command 21.
+- **Fix:** `camera_answer` (`hle_sf.c`) answers commands 3 and 4 with success, 21 with an event that never fires, and the others, 29 among them, with 0x7c4, so the game sees a console whose camera port has nothing plugged in. `nn::applet::BeginUsingCameraResource` / `EndUsingCameraResource` (the module takes the applet's camera resource) and `nn::camera::sdk::DestroyCameraContext` succeed too; the SDK's versions read service objects the host never made. The client also ends the session with an HIPC Close (message type 2), answered with the closed-session result 0xf601 (`hle_sf.c`); before that it logged `[RED] sf: camera: HIPC message type 2 not served`. Mario Kart World 1.8.0, whose reading of 0xdc4 the old answer followed, is not re-tested here.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md).
+
+### Whether the language selection is limited
+
+- **Symptom:** a null read at boot in `nn::oe::IsLanguageSelectionLimited`, right after the game asks for its language.
+- **Cause:** the SDK asks the `am` session at vtable +0x238, and the host never opens that session (`oe::Initialize` is taken over).
+- **Fix:** hooked: no limit; the host's language is `DM_LANG` alone (`hle_oe.c`).
+- **Found on:** Hyrule Warriors: Age of Imprisonment (upstream nxnative, d70ee900; its profile is not on this branch).
+
+### Application GPU scheduling time
+
+- **Symptom:** a null read in `nn::os::SdkMutexType::Lock`, at `sdk+0x151fb0`, called from `nn::gs::sdk::QueryApplicationGpuTimeSpan` after the first rendered frame.
+- **Cause:** the query asks the graphics server's session (command 27), which the host never opens, how much of an interval the GPU was given to the application rather than to another of the console GPU's clients (the system's own rendering). Its two times are nanoseconds on the system tick clock; callers pass intervals bracketed by their own GPU counter timestamps.
+- **Fix:** `hle_nv.c` answers the whole interval (`end - begin`, 0 if `end` is not later) with success. The host's counter timestamps are its model of the console GPU's timeline ([GPU timestamps per submission segment](frame-rate.md#gpu-timestamps-per-submission-segment)), on which the application is the only client. It is not the GPU's busy time: Welcome Tour's Bezel profiler queries each render pass's GPU region (`main+0x30a8f4`) and the whole frame's (`main+0x30a808`), and the frame load its dynamic resolution reads is the frame's scheduled time, plus the time the application was not scheduled since the previous frame, plus 0.36 ms. With busy time the GPU's idle time between frames would count as taken, and every frame would read as full. The earlier stub returned `0xaf3` (not even the SDK's own unavailable-session result, `0x30af3` at `sdk+0x41200c`); Bezel then took each region's length and left out the 0.36 ms margin.
+- **Found on:** [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md), update v262144 (`sdk+0x411dc0`, called from `main+0x30a840`).
+
+### The target frame rate (graphics frame length)
+
+- **Symptom:** a null read at boot in `nn::os::SdkMutexType` under `nn::gs::sdk::SetGraphicsFrameLengthMode`, called from `nn::oe::SetGraphicsTargetFrameRate`.
+- **Cause:** `SetGraphicsTargetFrameRate` maps up to 59 fps to mode 1, up to 119 to mode 2 and above to mode 3 (`SetGraphicsTargetFrameRateAuto` to mode 0) and calls `SetGraphicsFrameLengthMode`, which locks the gs graphics server's context and sends it the mode. The host has no graphics server, so the context is null.
+- **Fix:** `SetGraphicsFrameLengthMode` is hooked and logs the mode once per change; both `oe` paths reach it. The host paces by the window's present interval (`hle_oe.c`).
+- **Found on:** Hyrule Warriors: Age of Imprisonment (upstream nxnative, d70ee900; its profile is not on this branch): 60 / its present interval at boot.
+
+### `vi::InitializeWithVrrLfcEnabled`
+
+- **Symptom:** SIGSEGV reading address 0 in `SdkMutexType::Lock` right after graphics initialize, under `nn::vi2::InitializeWithVrrLfcEnabled`.
+- **Cause:** the Switch 2 SDKs' display initialize with low frame rate compensation for a variable refresh rate display. It does `nn::vi::Initialize`'s work through `vi2`, whose VRR hooks lock the mutex at the start of `nn::gsv::GetUserSession()`'s session, which the host never opens.
+- **Fix:** the host takes it over like `nn::vi::Initialize` (`hle_vi.c`): it has no vi service and no VRR display (`QueryDisplayVrrSupported` says so). From upstream nxnative (11825d2a).
+- **Found on:** [Resident Evil 4](../../dm/games/0400569027BF4000/README.md) (v131072, SDK 21.4.3: `main+0xb180288` → `sdk+0x5d8cf0`, upstream); [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md) (v262144, SDK 20.5.29), at boot.
+
+### Eventfds served offline
+
+- **Symptom:** gRPC in Nintendo's online library (NPLN) aborts at startup (`main+0x21f0c7c`) because its poll engine's initializer (`main+0x21f1280`) finds no wakeup fd while socket calls fail offline.
+- **Cause:** `nn::socket::EventFd` is Linux's `eventfd` exposed through the bsd service. As a local counter it does not require an active network session, but the offline cut had failed all socket calls indiscriminately.
+- **Fix:** implement eventfd counters (descriptors 512..575) directly in `dm/host/hle_net.c`: tracking counts, nonblocking modes and semaphore semantics with `pthread_cond_timedwait` for poll/select.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### An asynchronous play report opens prepo:u
+
+- **Symptom:** crash or abort at the first gameplay transition when sending an asynchronous play report (`nn::prepo::PlayReport::Send`).
+- **Cause:** `PlayReport::Send` returns a nontrivial `AsyncContext` in the caller's x8 storage that expects an initialized state and connects to `prepo:u` if unhandled.
+- **Fix:** in `dm/host/hle_offline.c`, `h_prepo_SendU` invokes the guest's `nn::prepo::AsyncContext::AsyncContext(Result)` constructor with `RES_OK` via x8, completing the asynchronous telemetry report offline without requiring a service session.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).

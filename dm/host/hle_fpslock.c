@@ -1,0 +1,1027 @@
+// Engine frame limits kept in game memory (FPSLocker's evaluate_write entries): some engines cap their own frame rate with a value the host can raise. The target is the profile's
+// fps_target (DM_FPS_TARGET overrides; 0 = leave the game's own limit), the same key that drives Tears of the Kingdom's frame step (loader.c install_fps_state). Called on every present
+// (hle_nvn.c); the game sets the values after boot and may set them again, so each is written whenever it differs. Fixed addresses: each row runs only on the main build it was found in (AGENTS.md).
+// Unreal Engine needs no row: the rewriter finds its console variables by their registered names in any build (dm/tools/ue_cvar.py, main's fixups UE_CVAR:<name>), and the host writes
+// the frame limit, the profile's ue_fps_cvar (t.MaxFPS, or a game's own variable its settings apply to t.MaxFPS: SHIN MEGAMI TENSEI V: Vengeance's Project.FrameRateLimit), and the
+// present interval, rhi.SyncInterval (nvn.SyncInterval in UE 4.18's Switch RHI: DRAGON QUEST XI S). Each is a TAutoConsoleVariable whose +0x10 points to its value, the game thread's
+// copy then the render thread's. The games' configs set the limit to 30 and the interval to 2 (their notes name the .ini files). An engine with a fixed frame rate (bUseFixedFrameRate) steps
+// by and holds to UEngine::FixedFrameRate instead, which the rewriter finds through its reflection entry and GEngine where the engine is made (dm/tools/ue_fixed_rate.py, main's fixups
+// UE_FIXED_RATE_PTR / _FIELD / _FLAG: Pikmin 4). It is written only while the object's bUseFixedFrameRate is set (_FLAG), so an engine stepping by the time that passed is left as it is.
+// Nor do Unity's Application.targetFrameRate and QualitySettings.vSyncCount need a row: the rewriter finds them through the engine's internal-call table (dm/tools/unity_fps.py, main's
+// fixups UNITY_*). Monolith's native interval controls both the wait and the simulation's elapsed-time step; monolith_fps.py recognizes reviewed engine implementations and derives its
+// global (MONOLITH_INTERVAL: Xenoblade Chronicles 2 and 3, X DE). These came from upstream nxnative (f5f6d4b5, bd979ced, 62f6a52c, 50aefc12, aa9e0ff7)
+#include "hle.h"
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <errno.h>
+
+// What a field holds: the frame rate as a float, double or int32, vsyncs per frame (60 / frame rate) as an int32, or the frame time in milliseconds as a float. Copies: consecutive copies of the
+// value (Unreal keeps one for the game thread, one for the render thread). A row with no pointer (ptr_off 0) has its field at main + field: a constant in main's read-only data, which the loader
+// leaves writable (the image's data block on iOS too, loader.c map_image).
+// At 60 a frame time gets MS_MARGIN less than the vsync: such a limiter counts from the frame's start, and the work after it (the GPU fence wait, the next frame's start) adds to the
+// period, so frames at exactly 16.667 ms came 0.11 ms late each on the Mac (59.6 fps, every 150th frame shown two vsyncs). Slightly shorter, the host's present pacing sets the pace
+// (the acquire waits): Luigi's Mansion 3's display interval p99 18.69 → 16.67 ms, 60.0 fps. Not at 30: with present_interval display the presents follow every vsync and hold no
+// frame for two, so a shorter time showed some frames for one (30.4 fps); 30 writes the game's own 33.333 ms
+// Also: a frame time in ticks as a uint32 (scale / frame rate: 19,200,000 for the Switch's 19.2 MHz system tick), a frame step in seconds as a float (1 / frame rate), and a mode
+// switch an engine reads before it takes those fields at all (written 1 at any target)
+// And a floor: the least vsyncs per frame (60 / frame rate) a dynamic present interval controller may pick (sead's, Donkey Kong Bananza). Unlike the others it does not fix the
+// rate: the game still raises its interval when frames run long and steps its logic by the interval it picked, so presentation keeps following the game's interval
+// (dm_fps_lock_engine leaves floors out). Target 60 writes 1, the controller's own floor. The int32 after the floor is the controller's own maximum, which the game sets (3 in
+// Donkey Kong Bananza): a floor above it breaks the controller's min <= max, and DKB's then stayed at the floor (interval 4 at a 15 cap) and never came back down when the host
+// put its floor back, until the game restarted. So a floor row never writes above that maximum, and a rate needing more vsyncs than that is not offered (row_holds)
+// The vsync kinds hold only rates that divide 60 (60, 30, 20, 15); the rate kinds any target (rate_ok)
+// And a step count: a framework that runs a whole number of fixed steps each frame and presents at that many vsyncs, picked by a mode field before it (a profile's fps_steps rows; steps_tick)
+// And a frame controller's range of extra vsyncs as two bytes, the least then the most it may wait (Link's Awakening's Grezzo controller: its 30 fps mode is one extra vsync with two
+// world steps a frame; a late frame takes it there, a quick one back, no hysteresis). Target 60 writes 0, 0 (never 30: a late frame shows one vsync late instead), 30 writes 1, 1.
+// The game rewrites both itself (boost on and off, a level's own least), so the row is re-asserted at every present; the game keeps setting its present interval (follows_game)
+// And Monolith's interval: vsyncs per frame as an int32 whose 0 means the engine's native default of 2 (VSYNCS_DEFAULT2_I32)
+enum { FPS_F32, VSYNCS_I32, MS_F32, FPS_I32, TICKS_U32, SECS_F32, MODE_U32, FPS_F64, MIN_VSYNCS_I32, STEPS_I32, EXTRA_VSYNCS_U8, VSYNCS_DEFAULT2_I32 };
+#define MS_MARGIN 0.5f
+static float ms_want(int fps) { return 1000.0f / (float)fps - (fps == 60 ? MS_MARGIN : 0); }
+// deref: after [main + ptr_off], nderef more pointers, each at the object reached so far + deref[i] (an object behind a global, then members)
+// flag: byte offset << 8 | bit mask the object must have set for the write (0: none; Unreal's bUseFixedFrameRate)
+typedef struct { const char *build, *what; uint64_t ptr_off; uint32_t field; uint8_t kind, copies; uint32_t scale; uint8_t nderef; uint16_t deref[3]; uint32_t flag; } lock_t;
+static int vsync_kind(int kind) { return kind == VSYNCS_I32 || kind == MIN_VSYNCS_I32 || kind == STEPS_I32 || kind == EXTRA_VSYNCS_U8 || kind == VSYNCS_DEFAULT2_I32; }
+static int follows_game(int kind) { return kind == MIN_VSYNCS_I32 || kind == STEPS_I32 || kind == EXTRA_VSYNCS_U8; }   // the game still sets its present interval itself (dm_fps_lock_engine leaves these out)
+static int rate_ok(int kind, int target) { return !vsync_kind(kind) || 60 % target == 0; }
+static const lock_t k_locks[] = {
+    // Donkey Kong Bananza v458752: sead's dynamic present interval controller (main+0x204a18, called each frame from the framework's main+0x203674). It picks the interval from
+    // the last frame's start to the later of its submission and its GPU end, clamps it to [+0, +4] (its settings, 1 and 3, made in nnMain at main+0x5bf180 and copied in by
+    // main+0x5bfb20), and hands 60 / interval to the framework's frame rate (main+0x204c60, framework+0xe0) and the interval to the window (main+0x204c00, framework+0x88): the
+    // game's logic steps by that interval, as BotW's VFR does (docs/reference/frame-rate.md). A floor of 2 makes the game itself run at 30 and stay at the right speed.
+    // The controller is at [framework+0x218] (main+0x5bfb00); the framework at [app], the app object at main+0x26cc208 (nnMain main+0x5bdff4, its GOT slot main+0x2455ca0)
+    { "e25c90c1c136638885659fd55bf8a03b", "sead frame-rate controller minimum interval", 0x26cc208, 0x0, MIN_VSYNCS_I32, 1, 0, 2, {0x0, 0x218} },
+    // The Legend of Zelda: Link's Awakening 1.1.0: Grezzo's frame controller (main+0xc910, a virtual method; its decision at main+0xca64..+0xcb28). Each frame it counts the vsyncs the
+    // last frame missed ([gfx+0x81ac] − +0x4dc), takes one off when that frame's CPU time (system tick, limit 13,333,332 ns at main+0x1cab1f8) and GPU time ([gfx+0x81c0], limit
+    // 14,166,666 ns at main+0x1cab1e8) were both under their limits, clamps the count to [+0x4e2 least, +0x4e3 most] on the game manager and writes it to +0x4e1 (and the extra world
+    // step to +0x4e0); main+0x17800 then asks the window for interval +0x4e1 + 1. The constructor (main+0x7370) sets least 0, most 1; boost entry sets most = least, boost exit most = 1
+    // again, and a level sets its own least (main+0x858234). The game manager is the pointer at main+0x1c97188 (made at main+0x1bc18). On an Android phone the game's work fills the 16.7 ms
+    // and a few frames in a hundred run late, each a flip to 30 and back (50-58 fps on the overlay); with least = most = 0 those frames show one vsync late instead and the world
+    // steps once a frame as at 60. Found 2026-11-12 (LAS recomp's pace.c describes the same bytes for 1.0.1; the layout did not change)
+    { "909e904af78ac1b8deefe97ab2ccdb51", "Grezzo frame controller extra vsyncs", 0x1c97188, 0x4e2, EXTRA_VSYNCS_U8, 1 },
+    // The Legend of Zelda: Echoes of Wisdom 1.1.0 (v196608): Grezzo's frame governor, rewritten since Link's Awakening (no least / most bytes: the clamp pattern is not in this
+    // main). The game manager is a static object at main+0x34bd4b0 (bss; made at main+0x33b1e4, handed to its per-frame task object {vtable main+0x3085020, manager} at
+    // main+0x3432d4); its frame task main+0x345da0 (vtable +0x78; the governor from +0x346b8c) takes this frame's cost as the larger of the CPU time since the last frame less the
+    // acquire wait (manager +0x3a8, main+0x3472d0) and the GPU time ([gfx+0xbd88] ns, gfx = [[main+0x34cadd0]+8]), and runs a two-state machine: mode +0x3b0 (0 = 60, 1 = 30),
+    // one frame at or over 1/60 s (+0x3e5, the "last frame slow" byte, or the +0x3e0 count reaching 1) enters mode 1 for a hold of 12 frames (+0x3d8), renewed while any held frame
+    // ran slow (+0x3dc, never cleared here), and the present interval request [gfx+0xbcc8] gets (int)(60 / rate + 0.5): 2 at the entry (main+0x346d38), 1 on the way back
+    // (main+0x346e00), applied by the presenter main+0x3610c4 (nvnWindowSetPresentInterval through main+0x32ca34). The byte before all that, +0x3e4, is the governor's enable: the
+    // scene code sets it 1 entering play (main+0x1685dc8) and 0 leaving (main+0x167bc0c, main+0x168a760); with it 0 the task's other branch (main+0x346d50) writes interval 1 and
+    // clears the mode and counts. So this row's two bytes are +0x3e4 enable and +0x3e5 last-frame-slow: target 60 writes 0, 0 (governor off: the game itself asks for interval 1
+    // every frame, as in menus), 30 writes 1, 1 (governor on and "slow": mode 1, interval 2, held). Re-asserted at every present because the scene code sets the enable again. On
+    // an Android phone the game saw 1.3 ms of CPU and 4.4 ms of GPU yet sat at 30: a frame once over 1/60 s puts it there, and at interval 2 every frame measures over 1/60 s, so the hold
+    // renews itself for good. Found 2026-11-12 from main 9f221e1a (ptr_off 0: the field is at main + field)
+    { "9f221e1afa65ba5443e955158ab97da8", "Grezzo frame governor enable", 0, 0x34bd894, EXTRA_VSYNCS_U8, 1 },
+    // Persona 5 Royal 1.0.2 (main d4b150b29a931cd3): a present-interval field at the end of a pointer chain from a global in main's bss, [main+0x2327b90] -> +0x10 -> +0x60
+    // -> +0x8, field +0xf14 (an int32, 1 = 60 fps, 2 = 30 fps). From a build-ID-matched community cheat for this build (ChanseyIsTheBest/NX-60FPS-RES-GFX-Cheats,
+    // titles/01005CA01580E000/cheats/D4B150B29A931CD3.txt), decoded against the cheat VM's opcodes (four loads chaining the offsets above, an add of 0xf14, a store of 1 or 2).
+    // [main+0x2327b90] lies in main's own bss, consistent with a runtime object pointer; the function that builds the chain was not found, so the row is unconfirmed beyond
+    // the chain's shape and its place in bss (open: a run must check the frame rate and that nothing else broke). A second lead, a code patch of sdk+0x486da0 (`csel w8, w9,
+    // w8, gt; str w8, [x0, #0xf24]`, StevensND/switch-port-mods), is not used: a static cut cannot follow fps_target at run time. No side effects (dialogue or animation speed)
+    // are reported for either fix, consistent with an engine that steps by real time (unlike Animal Crossing: New Horizons, dm/games/01006F8002326000/README.md)
+    { "d4b150b29a931cd381e2a30318fc299f", "Persona 5 Royal present interval", 0x2327b90, 0xf14, VSYNCS_I32, 1, 0, 3, {0x10, 0x60, 0x8} },
+    // Pokemon Sword / Shield 1.3.2:
+    // Game Freak's engine keeps a table of frame times in ns by present interval at main+0x203eeb0 (u64: 16666667, 33333334, 50000000, 66666667,
+    // 83333334; the same offset in both mains). The game runs in mode 1 (interval 2, 33333334 ns) and divides the measured frame time by its
+    // entry (Sword main+0x680fc4, main+0x687fc8). The community's 60 fps patch for 1.3.2 passes 1 to the present interval call (Sword
+    // main+0x18a2c88, Shield main+0x18a2d18) and makes the interval-2 entry 16666667; here the row writes the entry's low word (the high word
+    // is 0) and, being an engine row, makes presentation follow the cap instead of the game's interval 2 (hle_nvn.c fps_present_cap)
+    { "a3b75bcd3311385aeed67fbeeb79cbb7", "Game Freak frame time of interval 2", 0, 0x203eeb8, TICKS_U32, 1, 1000000000 },
+    { "a16802625e7826bf83b6f9708e475b91", "Game Freak frame time of interval 2", 0, 0x203eeb8, TICKS_U32, 1, 1000000000 },
+    // Pokemon Brilliant Diamond 1.3.0: Unity's Application.targetFrameRate. Its icall registration (main+0xe34e60) resolves to main+0xdc8e70 -> +0x5fa640,
+    // which stores w0 at main+0x4afc868; the getter at +0x5fa630 reads the same int32. The game sets 30 when entering the field; display pacing alone does not remove that cap.
+    { "94ceae325c205c4b9d6f7235552f28fd", "Unity targetFrameRate", 0, 0x4afc868, FPS_I32, 1 },
+    // Pokemon Shining Pearl 1.3.0, Brilliant Diamond's twin: the engine code is at the same place in its main (the setter at main+0x5fa630 stores w0 at main+0x4afc868,
+    // the getter at +0x5fa620 reads it; read from the build's own code)
+    { "38f59cbda2eb9c44b72f94c4d25935a2", "Unity targetFrameRate", 0, 0x4afc868, FPS_I32, 1 },
+    // Monster Hunter Rise 16.0.2: RE Engine's frame limit, a float at [main+0x1295b3f0]+0x434 (the pointer is a global in main's bss). The frame loop (main+0x6b106c8) sleeps until
+    // [+0x430] / [+0x434] sixtieths of a second have passed ([+0x430] = 60) and steps the game by the time that really passed (+0x41c), so a higher limit runs the game faster in frames
+    // at the same speed. The game sets 30 after boot; it also asks for present interval 2, which the profile's present_interval display ignores.
+    // From masagrator's FPSLocker config for this build (FPSLocker-Warehouse, patches/0100B04011742000/C9A3DD7702075ECD.yaml)
+    { "c9a3dd7702075ecd90101f4555389582", "RE Engine frame limit", 0x1295b3f0, 0x434, FPS_F32, 1 },
+    // Luigi's Mansion 3 1.4.0: Next Level Games' frame limiter. At the end of each frame the main thread calls the frame callbacks (main+0xb7c308) with the milliseconds since the frame
+    // started; the limiter (main+0x7a3e70) runs jobs or sleeps until 33.333 ms have passed, the float at main+0x13c94dc (read only there, at main+0x7a3ea8 and main+0x7a3f18), and the game
+    // steps by the time that really passed. The game asks for present interval 2 too, which the profile's present_interval display ignores; both are needed
+    { "79e5950ffa85acf63e28c9aec051eac2", "NLG frame limiter target", 0, 0x13c94dc, MS_F32, 1 },
+    // Need for Speed: Hot Pursuit Remastered 1.0.3: Criterion's frame timing. A uint32 in main's bss (main+0xf0043c) selects the engine's 60 fps mode, in which it takes its frame time from
+    // the timer object at [main+0xed96a8]: +0x30 the frame in system ticks (19.2 MHz, 640,000 at 30 fps) and +0x28 a tenth of it; the game's own step, at [main+0xeffc60] +0x30 (2D) and +0x50
+    // (3D), is a float of seconds per frame. Its limiter, a spin on the system tick at main+0x483588..+0x4835a4, is cut by the rewriter (patches.py). From masagrator's FPSLocker config for this
+    // build (FPSLocker-Warehouse, patches/010029B0118E8000/799D1061182C1302.yaml; the frame-time instruction found by theboy181)
+    { "799d1061182c1302e08e706b84ce76e5", "Criterion 60 fps mode", 0, 0xf0043c, MODE_U32, 1, 0 },
+    { "799d1061182c1302e08e706b84ce76e5", "Criterion frame ticks", 0xed96a8, 0x30, TICKS_U32, 1, 19200000 },
+    { "799d1061182c1302e08e706b84ce76e5", "Criterion frame ticks / 10", 0xed96a8, 0x28, TICKS_U32, 1, 1920000 },
+    { "799d1061182c1302e08e706b84ce76e5", "Criterion 2D game step", 0xeffc60, 0x30, SECS_F32, 1, 0 },
+    { "799d1061182c1302e08e706b84ce76e5", "Criterion 3D game step", 0xeffc60, 0x50, SECS_F32, 1, 0 },
+    // EA SPORTS FC 27 1.8d.310c: the game's frame regulator, an object at [main+0xda20e38] (its constructor, main+0x99e80c8, sets 60.0). Its tick (main+0x99ea580) waits until
+    // 1 / [+0x8] seconds have passed since the last frame; [+0x10] is the rate it reports. main+0x5d501c0 sets both to 30.0 whenever GameRenderSettings.Enable is 1 (fmov v1.2d, #30.0;
+    // stur q1, [x9, #8]), a constant of the Switch build, so it is written here. The simulation's own rate is Frostbite's SimulationTimeSettings, set below by name: on a build without
+    // this row the game keeps 30 fps at the right speed (the simulation at 60 and the regulator at 30: match clock as at 30). The game asks for present interval 2
+    // (BaseDisplaySettings.PresentInterval), which the profile's present_interval display ignores
+    { "a48c0de3bc353efa0e4d359bde05ef24", "FIFA frame regulator", 0xda20e38, 0x8, FPS_F64, 2, 0 },
+};
+#define NLOCKS ((int)(sizeof k_locks / sizeof k_locks[0]))
+// Fixed steps per frame, the profile's fps_steps rows (dm/games/game.py; one per main build): a framework at [main + global] then [that + each member], whose frame function picks
+// a step count into a field from a mode field before its update, runs the update that many fixed steps, and sets the window's present interval to the count. Mario Kart World 1.8.0
+// (dm/games/0400C3F00006E000/README.md, Frame rate cap): procFrame main+0x69cbb0, mode +0x210 (0 = 1 step, or 2 after its own work overran; 1 = 1; 2 = 2, the game's 30 fps form for
+// three or four players; any other value leaves the count as it is), count +0x214. A cap of 30 writes mode 2, the game's own 30 fps; 20 writes the count 3 and a mode outside
+// 0..2 (STEPS_HOLD), which keeps it; 60 and 0 leave the game's own mode (it runs 2 steps on a frame that overran: full speed at 60 or below). Each step stays 1/60 s, so the race,
+// ghosts, time trials and online races step as at 60. DM_FPS_STEPS_ROWS: the unit tests' own rows
+#ifndef DM_FPS_STEPS_ROWS
+#define DM_FPS_STEPS_ROWS DM_GAME_FPS_STEPS
+#define DM_FPS_NSTEPS_ROWS DM_GAME_NFPS_STEPS
+#endif
+typedef struct { const char *build; uint64_t ptr_off; uint32_t mode, count; uint8_t nderef; uint16_t deref[3]; } steps_row_t;
+static const steps_row_t k_steps[] = DM_FPS_STEPS_ROWS;
+#define NSTEPS DM_FPS_NSTEPS_ROWS
+#define STEPS_MAX 3    // 20 fps: the most steps a frame offered (each 1/60 s)
+#define STEPS_HOLD 3   // a mode outside the game's 0..2: its pick then leaves the count the host wrote
+// A draw-every-other-step flag, the profile's fps_half_draw rows (dm/games/game.py; one per build of the module that holds it, which may be an NRO): an engine that steps once a
+// frame call and has a flag that makes it draw and present only every second step, at present interval 2, while the steps stay 1/60 s. Mario Tennis Fever 1.1.1
+// (dm/games/0400D4201C6EA000/README.md, Frame rate): Camelot's engine, flag 15 of its flag array, bit 0 of the byte at nro0+0x3ec09e5, read at the start of each frame
+// (nro0+0x11f75b0). A cap of 30 sets the bit: 60 steps a second, 30 frames drawn, so the game keeps its speed where a late frame at interval 1 halves it. Any other cap, and no
+// cap, clears a bit the host set (one the game set itself stays). The game sets its present interval itself, so presentation follows the game (follows_game's rule: half_find in
+// dm_fps_lock_floor). The module may load after main (an NRO), so it is looked for until found. DM_FPS_HALF_ROWS: the unit tests' own rows
+#ifndef DM_FPS_HALF_ROWS
+#define DM_FPS_HALF_ROWS DM_GAME_FPS_HALF_DRAW
+#define DM_FPS_NHALF_ROWS DM_GAME_NFPS_HALF_DRAW
+#endif
+typedef struct { const char *module, *build; uint64_t off; uint8_t mask; } half_row_t;
+static const half_row_t k_half[] = DM_FPS_HALF_ROWS;
+#define NHALF DM_FPS_NHALF_ROWS
+static struct { _Atomic(uint8_t *) p; uint8_t mask, ours; int nlog, refused; } g_half;
+static uint8_t *half_find(void) {
+    uint8_t *p = atomic_load(&g_half.p);
+    if (p || !NHALF) return p;
+    for (int i = 0; i < g_nmod && !p; i++) for (int k = 0; k < NHALF && !p; k++)
+        if (k_half[k].build[0] && !strcmp(g_mod[i].name, k_half[k].module) && !strcmp(g_mod[i].build_id, k_half[k].build)) { g_half.mask = k_half[k].mask; p = g_mod[i].base + k_half[k].off; }
+    if (p) atomic_store(&g_half.p, p);
+    return p;
+}
+static int half_holds(int t) { return (t == 30 || t == 60) && half_find(); }
+// True while a profile's fps_half_draw module (e.g. an NRO decoded after main) has not loaded yet, so cap status reports "starting" instead of caching "picks its own"
+int dm_fps_lock_pending(void) {
+    if (!NHALF || half_find()) return 0;
+    for (int k = 0; k < NHALF; k++) if (k_half[k].module[0]) {
+        int seen = 0;
+        for (int i = 0; i < g_nmod && !seen; i++) seen = !strcmp(g_mod[i].name, k_half[k].module);
+        if (!seen) return 1;
+    }
+    return 0;
+}
+static int rd(uint64_t a, void *out, size_t n) { return a >= 0x1000 && !plat_mem_read(a, out, n); }
+
+// NieR 1.0.3 exposes its preset minimum but ships fixed mode-specific fallbacks.
+// Keep the native current-scale and UV controller intact; only select its
+// verified lower bound. This is independent of the FPS choice.
+// The 1.0.3 builds the rewrite cuts (patches.py): the scale clamp and the publish branch that are checked, the two fallback floors the cuts
+// replace, and the preset minimum. The Asian release (0100B8E016F76000) shifts the function by 0x13c0; its preset minimum is the target of the
+// relocation of the slot the function loads it through (main+0x12c8500).
+// display is the game's display object: its first word points to the NVN device (the present interval at +0x9c160), and +0x504 is the frame-interval
+// mode (0: 60 fps, 1: 30 fps) the setter main+0x9c0590 (Asian release; the global's 0x13c0 before) writes; in the Asian release it is the target of the
+// relocation of the slot that setter reads (main+0x12c2d18).
+static const struct { const char *build; uint32_t clamp, publish, floor0, floor1, minimum, display; } k_nier_dr[] = {
+    {"3c10ec35c5ef4c3686b4053afb0e58e7", 0x9bf568, 0x9bf578, 0x9bf528, 0x9bf534, 0x128e068, 0x192be00},
+    {"98397a10419894652f372d4dc1b6fc2c", 0x9c0928, 0x9c0938, 0x9c08e8, 0x9c08f4, 0x128f130, 0x192d600},
+};
+static void dynamic_resolution_tick(void) {
+    static int state = -1, dynamic, row;
+    static uint8_t *base;
+    if (state < 0) {
+        state = 0;
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+            for (int k = 0; k < (int)(sizeof k_nier_dr / sizeof *k_nier_dr); k++) if (!strcmp(g_mod[i].build_id, k_nier_dr[k].build)) { base = g_mod[i].base; row = k; }
+        if (!base) return;
+        const char *e=getenv("DM_DYNAMIC_RESOLUTION");
+        if (e && strcmp(e,"0") && strcmp(e,"1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution",e);
+        dynamic=e && !strcmp(e,"1");
+        if (dynamic) {
+            uint32_t clamp = 0, publish = 0;
+            uint64_t floors[2] = {0};
+            if (!rd((uint64_t)(base + k_nier_dr[row].clamp), &clamp, 4) || !rd((uint64_t)(base + k_nier_dr[row].publish), &publish, 4) ||
+                !rd((uint64_t)(base + k_nier_dr[row].floor0), &floors[0], 8) || !rd((uint64_t)(base + k_nier_dr[row].floor1), &floors[1], 8) ||
+                clamp != 0x1e254c80u || publish != 0x54000489u ||
+                floors[0] != 0x72a7f00c5280000cull || floors[1] != 0x72a7f00c5280000cull) {
+                LOG("[RED] dynamic resolution needs a verified native scale/UV rewrite; keeping full resolution");
+                dynamic = 0;
+            }
+        }
+        state=1;
+        LOG("main: NieR dynamic resolution %s (DM_DYNAMIC_RESOLUTION)",dynamic?"on; native controller, 70–100% scale":"off; full resolution");
+    }
+    if (!state) return;
+    uint32_t cur[2];
+    uint64_t a = (uint64_t)(base + k_nier_dr[row].minimum);
+    if (!rd(a, cur, sizeof cur)) return;
+    uint32_t minimum = dynamic ? 0x3f333333u : 0x3f800000u;
+    if (cur[0] != minimum) {
+        uint32_t *p = (uint32_t *)(uintptr_t)a;
+        dm_guest_write_prepare(p, 4);
+        __atomic_store_n(p, minimum, __ATOMIC_RELAXED);
+    }
+    if (!dynamic && cur[1] != 0x3f800000u) {
+        uint32_t *p = (uint32_t *)(uintptr_t)(a + 4);
+        dm_guest_write_prepare(p, 4);
+        __atomic_store_n(p, 0x3f800000u, __ATOMIC_RELAXED);
+    }
+}
+
+// Frostbite's simulation rate, found by name (no fixed addresses, so it holds across a game's updates). Frostbite reflects its settings classes: a class record (its name, then at
+// +0x40 its field list) and per field a record of 0x20 bytes (name, hash, offset at +0x10, type). SimulationTimeSettings' ForceSimRate (int32) and MaxSimFps (float) cap the
+// simulation's ticks a second: 30 in EA SPORTS FC 27, whose frames then cannot go faster than 30 whatever paces them. A static constructor registers the class: it stores the record's
+// address into its type info (adrp / add of the record, then str into the type info just made by adrp / add), and the code that reads the settings asks the settings registry for the
+// instance with that type info in x1 and a cache word in x2 (adrp / add each, then bl), which keeps the instance's address. The instance holds its type info at +8, which checks the cache.
+// Both fields are written each frame they differ (the game may load its settings again), like the frame limits above
+static struct { int n; uint8_t *base; uint64_t ti, cache[8]; int ncache; uint32_t off_rate, off_max; } fb;
+static int fb_name_at(uint8_t *base, uint64_t size, uint64_t p, const char *want) {   // p, a relocated pointer, points into the module at the string want
+    uint64_t b = (uint64_t)(uintptr_t)base; size_t n = strlen(want);
+    return p >= b && p - b + n + 1 <= size && !memcmp((const void *)(uintptr_t)p, want, n + 1);
+}
+static int64_t fb_pair(const uint32_t *t, uint64_t i, int reg) {   // the target of adrp / add into reg at words i, i + 1, or -1 (module offsets: the text sits at offset 0)
+    uint32_t w = t[i], x = t[i + 1];
+    if ((w & 0x9F000000u) != 0x90000000u || (int)(w & 31) != reg || (x & 0xFFC00000u) != 0x91000000u || (x & 31) != (uint32_t)reg || ((x >> 5) & 31) != (uint32_t)reg) return -1;
+    int64_t imm = (int64_t)(((w >> 29) & 3) | (((w >> 5) & 0x7FFFF) << 2)); if (imm & (1 << 20)) imm -= 1 << 21;
+    return (int64_t)((i * 4) & ~0xfffull) + imm * 4096 + ((x >> 10) & 0xfff);
+}
+static void fb_find(void) {
+    module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
+    if (!m || !m->text_end || !m->ro_off || m->ro_off >= m->size) return;
+    static const char cls[] = "SimulationTimeSettings";
+    uint8_t *base = m->base, *ro = base + m->ro_off; uint64_t size = m->back_off ? m->back_off : m->size, b = (uint64_t)(uintptr_t)base;
+    const uint8_t *s = memmem(ro, (size_t)(size - m->ro_off), "\0SimulationTimeSettings\0", sizeof cls + 1); if (!s) return;   // not Frostbite
+    uint64_t name = (uint64_t)(uintptr_t)(s + 1), rec = 0;
+    for (uint64_t o = (m->ro_off + 7) & ~7ull; o + 0x48 <= size && !rec; o += 8) {
+        if (*(uint64_t *)(base + o) != name) continue;
+        uint64_t fl = *(uint64_t *)(base + o + 0x40); if (fl < b || fl - b + 0x20 > size) continue;
+        for (uint64_t f = fl - b; f + 0x20 <= size; f += 0x20) {   // the field list ends where a name stops being one
+            uint64_t fn = *(uint64_t *)(base + f); if (fn < b || fn - b >= size) break;
+            uint32_t off = *(uint32_t *)(base + f + 0x10);
+            if (fb_name_at(base, size, fn, "ForceSimRate")) fb.off_rate = off;
+            else if (fb_name_at(base, size, fn, "MaxSimFps")) fb.off_max = off;
+        }
+        if (fb.off_rate && fb.off_max) rec = o;
+    }
+    if (!rec) { LOG("[RED] main: Frostbite's %s found, but not its ForceSimRate and MaxSimFps fields; leaving the simulation rate", cls); return; }
+    const uint32_t *t = (const uint32_t *)base; uint64_t nw = m->text_end / 4;
+    for (uint64_t i = 0; i + 3 < nw && !fb.ti; i++) {   // the registration: adrp / add xR = record, str xR, [xT] with xT = the type info from an adrp / add just before
+        int r = (int)(t[i] & 31); if (fb_pair(t, i, r) != (int64_t)rec) continue;
+        uint32_t st = t[i + 2]; if ((st & 0xFFFFFC00u) != 0xF9000000u || (int)(st & 31) != r) continue;   // str xR, [xT] (no offset)
+        int xt = (int)((st >> 5) & 31);
+        for (uint64_t k = i >= 6 ? i - 6 : 0; k < i; k++) { int64_t ti = fb_pair(t, k, xt); if (ti > 0) fb.ti = (uint64_t)ti; }
+    }
+    if (!fb.ti) { LOG("[RED] main: Frostbite's %s: its type info was not found; leaving the simulation rate", cls); return; }
+    for (uint64_t i = 8; i + 12 < nw && fb.ncache < 8; i++) {   // the readers: adrp / add x1 = type info, adrp / add x2 = cache word, near each other before a bl
+        if (fb_pair(t, i, 1) != (int64_t)fb.ti) continue;
+        for (uint64_t k = i - 8; k < i + 10; k++) {
+            int64_t c = fb_pair(t, k, 2); if (c <= 0 || (uint64_t)c + 8 > m->size) continue;
+            int known = 0; for (int j = 0; j < fb.ncache; j++) known |= fb.cache[j] == (uint64_t)c;
+            if (!known) fb.cache[fb.ncache++] = (uint64_t)c;
+            break;
+        }
+    }
+    if (!fb.ncache) { LOG("[RED] main: Frostbite's %s: no settings lookup found; leaving the simulation rate", cls); return; }
+    fb.base = base; fb.n = 1;
+    LOG("main: Frostbite %s at main+%#llx (ForceSimRate +%#x, MaxSimFps +%#x), type info main+%#llx, %d instance caches", cls, (unsigned long long)rec, fb.off_rate, fb.off_max,
+        (unsigned long long)fb.ti, fb.ncache);
+}
+static void fb_tick(int target, const char *src) {
+    static int nlog; uint64_t ti = (uint64_t)(uintptr_t)(fb.base + fb.ti);
+    for (int j = 0; j < fb.ncache; j++) {
+        uint64_t inst = 0, tinfo = 0; int32_t rate; float max;
+        if (!rd((uint64_t)(uintptr_t)(fb.base + fb.cache[j]), &inst, sizeof inst) || !inst || !rd(inst + 8, &tinfo, sizeof tinfo) || tinfo != ti) continue;   // not made yet, or another word
+        if (!rd(inst + fb.off_rate, &rate, sizeof rate) || !rd(inst + fb.off_max, &max, sizeof max)) continue;
+        if (rate != target) { int32_t *p = (int32_t *)(uintptr_t)(inst + fb.off_rate); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, target, __ATOMIC_RELAXED); }
+        if (max != (float)target) { float w = (float)target, *p = (float *)(uintptr_t)(inst + fb.off_max); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint32_t *)p, *(uint32_t *)&w, __ATOMIC_RELAXED); }
+        if ((rate != target || max != (float)target) && nlog < 8) { nlog++; LOG("main: Frostbite simulation rate ForceSimRate %d, MaxSimFps %g → %d (%s)", rate, max, target, src); }
+        return;
+    }
+}
+
+// Shin'en's frame skip, found by name (no fixed addresses). The engine steps its game once a loop with a fixed 1/60 s (GfxDeltaTime = slow motion / the display's frame rate, a 60.0
+// that only the display's constructor writes), and its scripts count ticks, so a frame limit alone runs it slow: at 30 fps, half speed. Its own way to draw less often is the
+// timer's frame-skip type, which the scripts set through CGameEngine::SetFrameSkip(shn::eFrameskipType): each loop the timer sets bit 1 of its flags ("draw this frame"), and
+// the main loop skips the scene's render and the display's present and next acquire on a loop without it, while the game still steps. Type none draws every loop; odd every
+// second one (its 30 fps form); gpu, cpuGpu and cpuGpuDelta keep a debt in frames (the loop's measured time over the frame period, less one a loop, clamped to 0..4) and skip
+// while it is above one, so the game steps 60 times a second at any frame rate down to 15. Fast Fusion v262144: timer update main+0xfaad0 (the decision at +0xfabdc), main loop
+// main+0xf0600 (bit 1 at +0xf0740 / +0xf07e4), the timer at [main+0x718308] (set by its constructor, main+0xfa8fc), the type at +0x64 (SetFrameSkip's native main+0xeff68).
+// The finder reads the scripts' native binding table: name, wrapper pairs in main's data, the wrapper ending in a branch to the native. SetFrameSkip's native is
+// mov / movk w8 (the timer's offset in the engine), ldr x8, [x0, x8], str w1, [x8, #type], ret; isFrameSkipped's is adrp / add / ldr of the timer's global, then ldrb of its flags.
+// The type's values come from the enum's name table (name, value pairs). The host writes, every present, odd at a cap of 30 (60 steps, 30 frames drawn) and cpuGpu below it,
+// and presentation follows the cap (dm_fps_lock_engine): the drawn frames wait their 2 or 3 vsyncs, the skipped ones do not present at all, so 60 steps a second. The frame
+// limit (DM_FPS_LIMIT) counts too, the lower of the two: it paces the presents itself (fps_limit_wait), and a limit that is not 30 takes the debt form. The game's own type
+// comes back at 60 and with no cap; one the game sets meanwhile is the one given back. 15 is not offered: at four vsyncs a frame the debt reaches the clamp of 4
+static struct { int n, nlog; uint8_t *base; uint64_t global; uint32_t field; int32_t odd, debt, game, mine; uint8_t ours; } sk;
+static uint64_t sk_entry(uint8_t *base, uint64_t lo, uint64_t hi, const char *name) {   // the word after the data word that points to name (a native's wrapper, an enum's value), or 0
+    size_t n = strlen(name); uint64_t b = (uint64_t)(uintptr_t)base;
+    for (const uint8_t *s = base + lo; (s = memmem(s, (size_t)(base + hi - s), name, n + 1)) != NULL; s++) {
+        if (s[-1]) continue;   // the whole name, not the end of a longer one
+        uint64_t want = (uint64_t)(uintptr_t)s;
+        for (uint64_t o = (lo + 7) & ~7ull; o + 16 <= hi; o += 8) if (*(uint64_t *)(base + o) == want) return *(uint64_t *)(base + o + 8);
+    }
+    (void)b; return 0;
+}
+static uint64_t sk_native(uint8_t *base, uint64_t text_end, uint64_t wrapper) {   // the module offset of the native a wrapper branches to, or 0
+    uint64_t w = wrapper - (uint64_t)(uintptr_t)base;
+    if (wrapper < (uint64_t)(uintptr_t)base || w >= text_end || (w & 3)) return 0;
+    for (int k = 0; k < 16 && w + 4 * (uint64_t)k + 4 <= text_end; k++) {
+        uint32_t x = *(uint32_t *)(base + w + 4 * (uint64_t)k);
+        if ((x & 0x7C000000u) != 0x14000000u) continue;   // b / bl
+        int64_t imm = x & 0x3FFFFFF; if (imm & (1 << 25)) imm -= 1 << 26;
+        int64_t t = (int64_t)(w + 4 * (uint64_t)k) + imm * 4;
+        return t > 0 && (uint64_t)t + 20 <= text_end ? (uint64_t)t : 0;
+    }
+    return 0;
+}
+static void sk_find(void) {
+    module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
+    if (!m || !m->text_end || !m->ro_off || m->ro_off >= m->size) return;
+    uint8_t *base = m->base; uint64_t hi = m->back_off ? m->back_off : m->size, lo = m->ro_off;
+    if (!memmem(base + lo, (size_t)(hi - lo), "shn::eFrameskipType::odd", 25)) return;   // not Shin'en's engine
+    uint64_t set = sk_native(base, m->text_end, sk_entry(base, lo, hi, "CGameEngine::SetFrameSkip(shn::eFrameskipType)"));
+    uint64_t get = sk_native(base, m->text_end, sk_entry(base, lo, hi, "CGameEngine::isFrameSkipped()"));
+    int64_t odd = (int64_t)sk_entry(base, lo, hi, "shn::eFrameskipType::odd"), debt = (int64_t)sk_entry(base, lo, hi, "shn::eFrameskipType::cpuGpu");
+    const uint32_t *s = set ? (const uint32_t *)(base + set) : NULL, *g = get ? (const uint32_t *)(base + get) : NULL;
+    // SetFrameSkip: mov wE, #lo; movk wE, #hi, lsl #16; ldr xT, [x0, xE]; str w1, [xT, #type]; ret
+    int set_ok = s && (s[0] & 0xFFE00000u) == 0x52800000u && (s[1] & 0xFFE00000u) == 0x72A00000u && (s[0] & 31) == (s[1] & 31)
+                 && (s[2] & 0xFFE0FC00u) == 0xF8606800u && ((s[2] >> 16) & 31) == (s[0] & 31) && ((s[2] >> 5) & 31) == 0
+                 && (s[3] & 0xFFC0001Fu) == 0xB9000001u && ((s[3] >> 5) & 31) == (s[2] & 31) && s[4] == 0xD65F03C0u;
+    // isFrameSkipped: adrp xG; add xG, xG, #lo; ldr xG, [xG, #o]; ldrb wF, [xG, #flags]
+    int get_ok = g && (g[0] & 0x9F000000u) == 0x90000000u && (g[1] & 0xFFC00000u) == 0x91000000u && (g[2] & 0xFFC00000u) == 0xF9400000u && (g[3] & 0xFFC00000u) == 0x39400000u
+                 && ((g[1] >> 5) & 31) == (g[0] & 31) && ((g[2] >> 5) & 31) == (g[1] & 31) && ((g[3] >> 5) & 31) == (g[2] & 31);
+    if (!set_ok || !get_ok || odd < 1 || odd > 16 || debt < 1 || debt > 16 || odd == debt) {
+        LOG("[RED] main: Shin'en's frame skip names found, but not its setter, the timer or the type values (setter %s, timer %s, odd %lld, cpuGpu %lld); a frame rate cap is not held",
+            set_ok ? "ok" : "?", get_ok ? "ok" : "?", (long long)odd, (long long)debt);
+        return;
+    }
+    int64_t imm = (int64_t)(((g[0] >> 29) & 3) | (((g[0] >> 5) & 0x7FFFF) << 2)); if (imm & (1 << 20)) imm -= 1 << 21;
+    uint64_t glob = (uint64_t)((int64_t)(get & ~0xfffull) + imm * 4096) + ((g[1] >> 10) & 0xfff) + ((g[2] >> 10) & 0xfff) * 8;
+    if (glob + 8 > hi) return;
+    sk.base = base; sk.global = glob; sk.field = ((s[3] >> 10) & 0xfff) * 4; sk.odd = (int32_t)odd; sk.debt = (int32_t)debt; sk.n = 1;
+    LOG("main: Shin'en frame skip: the timer at [main+%#llx], its type at +%#x (SetFrameSkip main+%#llx; odd %d, cpuGpu %d)", (unsigned long long)glob, sk.field, (unsigned long long)set, sk.odd, sk.debt);
+}
+static int limit_raw(void);
+static void sk_tick(int target, const char *src) {
+    uint64_t t = 0; int32_t cur;
+    if (!rd((uint64_t)(uintptr_t)(sk.base + sk.global), &t, sizeof t) || !t || !rd(t + sk.field, &cur, sizeof cur) || cur < 0 || cur > 16) return;   // not made yet
+    int l = limit_raw(), c = target > 0 && target < 60 ? target : 0;
+    if (l > 0 && l < 60 && (!c || l < c)) c = l;
+    int32_t *p = (int32_t *)(uintptr_t)(t + sk.field), want = !c ? -1 : c == 30 ? sk.odd : sk.debt;
+    if (sk.ours && cur != sk.mine) sk.ours = 0;   // the game set its own since: that is the one to give back
+    if (!sk.ours) sk.game = cur;
+    if (want >= 0 && cur != want) {
+        dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED); sk.ours = 1; sk.mine = want;
+        if (sk.nlog < 16) { sk.nlog++; LOG("main: Shin'en frame skip type %d → %d at %d fps (%s: 60 steps a second, %s; %s)", cur, want, c, want == sk.odd ? "odd" : "cpuGpu",
+                                           want == sk.odd ? "every second frame drawn" : "frames drawn as time allows", c != target ? "the frame limit" : src); }
+    } else if (want < 0 && sk.ours) {
+        dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, sk.game, __ATOMIC_RELAXED); sk.ours = 0;
+        if (sk.nlog < 16) { sk.nlog++; LOG("main: Shin'en frame skip back to the game's own type %d (%s)", sk.game, src); }
+    }
+}
+
+// The row of a target frame rate the game steps by, at the place the rewriter found (dm/tools/fps_target.py; main's fixups FPS_TARGET_PTR, FPS_TARGET_FIELD): an int32 frame rate in the
+// object a global points to, which the game's readers divide 60.0 by to step it, and which the game sets to 30 or 60 itself. Fire Emblem Fortune's Weave's gxc graphics object holds it
+// (+0x1dc; its present asks for interval 60 / target), so at 60 the game asks for interval 1 and steps by 1.0 a frame. 0 rows: not found in this main
+static int target_row(const module_t *m, lock_t *out) {
+    if (!m->fps_target_ptr) return 0;
+    *out = (lock_t){ "", "target frame rate", m->fps_target_ptr, m->fps_target_field, FPS_I32, 1, 0 };
+    return 1;
+}
+
+// The Unreal rows of this main: the profile's frame-limit variable and the present intervals, at the objects the rewriter found, and the engine's fixed frame rate on GEngine (0 rows:
+// not an Unreal main). *missing: an Unreal main (the rewriter found some of its variables) without the profile's frame-limit variable
+static int ue_rows(const module_t *m, lock_t *out, int *missing) {
+    static char what[4][48]; int n = 0, have = 0;
+    if (m->ue_fixed_ptr && m->ue_fixed_flag)
+        out[n++] = (lock_t){ "", "Unreal fixed frame rate (GEngine->FixedFrameRate)", m->ue_fixed_ptr, m->ue_fixed_field, FPS_F32, 1, 0, 0, {0}, m->ue_fixed_flag };
+    for (int k = 0; k < m->n_ue_cvar && n < 4; k++) {
+        const char *name = m->ue_cvar[k].name; int fps = !strcmp(name, DM_GAME_UE_FPS_CVAR);
+        if (!fps && strcmp(name, "rhi.SyncInterval") && strcmp(name, "nvn.SyncInterval")) continue;
+        have |= fps; snprintf(what[n], sizeof what[n], "Unreal %s", name);
+        out[n] = (lock_t){ "", what[n], m->ue_cvar[k].off + 0x10, 0, fps ? FPS_F32 : VSYNCS_I32, 2, 0 }; n++;
+    }
+    *missing = m->n_ue_cvar > 0 && !have;
+    return n;
+}
+
+// Unity's frame rate, at the places the rewriter found through the engine's internal-call table (dm/tools/unity_fps.py; main's fixups UNITY_*), in any Unity build it reads:
+// Application.targetFrameRate, an int32 in main's bss (-1 until a game sets it: left so; a row below), and the current quality level's vSyncCount. On the Switch, Unity presents at
+// vSyncCount vsyncs a frame: QualitySettings.vSyncCount's setter hands the count to the graphics device, which calls nvnWindowSetPresentInterval when it changes, and Unity steps
+// the game by the time that really passed. The device takes the count only through the setter, so writing the level's count does not change the interval the game asks for: the
+// host's present cap does (hle_nvn.c), as for every engine limit here; the write keeps what the game reads back (QualitySettings.vSyncCount) the same as what it shows. Fire Emblem
+// Engage steps its frame-counted logic by that count (GameTime.VsyncFixedCount), so 60 / cap is also its speed. A count is a whole number of vsyncs: 60, 30, 20 and 15 only.
+// When the cap goes back to the game's own while the game runs, the count the game had is put back (the last level written; the game sets a level's count again at its next scene)
+static struct { uint8_t *base; uint64_t ptr; uint32_t idx, arr, size, vsync; uint64_t at; uint32_t orig; int nlog; } uq;
+static uint64_t unity_vsync_at(void) {   // the current level's vSyncCount, or 0 while the game has not made its settings
+    uint64_t obj = 0, arr = 0; int32_t lvl;
+    if (!rd((uint64_t)(uintptr_t)(uq.base + uq.ptr), &obj, sizeof obj) || !obj) return 0;
+    if (!rd(obj + uq.idx, &lvl, sizeof lvl) || lvl < 0 || lvl > 64 || !rd(obj + uq.arr, &arr, sizeof arr) || !arr) return 0;
+    return arr + (uint64_t)lvl * uq.size + uq.vsync;
+}
+static void unity_vsync_tick(int target, const char *src) {
+    uint64_t a = unity_vsync_at(); uint32_t cur, want = 60 / (uint32_t)target;
+    if (!a || !rd(a, &cur, sizeof cur) || cur == want || cur < 1 || cur > 4) return;   // already set, or 0: the game paces by targetFrameRate instead
+    if (a != uq.at) { uq.at = a; uq.orig = cur; }
+    uint32_t *p = (uint32_t *)(uintptr_t)a; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+    if (uq.nlog < 8) { uq.nlog++; LOG("main: Unity QualitySettings.vSyncCount %u → %u vsyncs (%d fps; %s)", cur, want, target, src); }
+}
+static void unity_vsync_restore(const char *src) {
+    uint32_t cur; if (!uq.at || !rd(uq.at, &cur, sizeof cur)) return;
+    if (cur != uq.orig) { uint32_t *p = (uint32_t *)(uintptr_t)uq.at; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, uq.orig, __ATOMIC_RELAXED); LOG("main: Unity QualitySettings.vSyncCount back to the game's %u (%s)", uq.orig, src); }
+    uq.at = 0; uq.nlog = 0;
+}
+// The running main's engine limiters, found once: by the first present (dm_fps_lock_tick) or by the graphics layer's present cap, which may ask first (dm_fps_lock_engine, from the acquire)
+#define NROWS (NLOCKS + 7 + NSTEPS)   // target, Monolith, four Unreal rows, Unity targetFrameRate, the steps rows
+static lock_t ue[4], target_lock, monolith_lock, unity_tfr, steps[NSTEPS > 0 ? NSTEPS : 1]; static const lock_t *rows[NROWS]; static int nrow, nier, ue_missing; static uint8_t *base; static uint32_t display;
+static pthread_once_t g_found = PTHREAD_ONCE_INIT;
+static void lock_find(void) {
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
+        // the rewriter left a timing correction this main's engine rule needs uninstalled (patch_nso.py NATIVE_FPS_BLOCKED): writing a frame rate would run the game at the wrong speed
+        if (g_mod[i].native_fps_blocked) { LOG("[RED] main: native frame target disabled: a required timing correction did not match"); continue; }
+        for (int k = 0; k < (int)(sizeof k_nier_dr / sizeof *k_nier_dr); k++) if (!strcmp(g_mod[i].build_id, k_nier_dr[k].build)) { base = g_mod[i].base; nier = 1; display = k_nier_dr[k].display; }
+        for (int k = 0; k < NLOCKS; k++) if (!strcmp(g_mod[i].build_id, k_locks[k].build)) { rows[nrow++] = &k_locks[k]; base = g_mod[i].base; }
+        if (target_row(&g_mod[i], &target_lock)) { rows[nrow++] = &target_lock; base = g_mod[i].base; }
+        int nue = ue_rows(&g_mod[i], ue, &ue_missing);
+        for (int k = 0; k < nue; k++) { rows[nrow++] = &ue[k]; base = g_mod[i].base; }
+        if (g_mod[i].monolith_interval) {
+            monolith_lock = (lock_t){ "", "Monolith frame interval", 0, (uint32_t)g_mod[i].monolith_interval, VSYNCS_DEFAULT2_I32, 1, 0 };
+            rows[nrow++] = &monolith_lock; base = g_mod[i].base;
+        }
+        if (g_mod[i].unity_target_fps) {   // unless a build row writes the same field
+            int dup = 0; for (int r = 0; r < nrow; r++) dup |= !rows[r]->ptr_off && rows[r]->field == (uint32_t)g_mod[i].unity_target_fps;
+            unity_tfr = (lock_t){ "", "Unity Application.targetFrameRate", 0, (uint32_t)g_mod[i].unity_target_fps, FPS_I32, 1, 0 };
+            if (!dup) { rows[nrow++] = &unity_tfr; base = g_mod[i].base; }
+        }
+        if (g_mod[i].unity_qs_ptr && g_mod[i].unity_qs_size) {
+            uq.base = g_mod[i].base; uq.ptr = g_mod[i].unity_qs_ptr; uq.idx = g_mod[i].unity_qs_idx; uq.arr = g_mod[i].unity_qs_arr; uq.size = g_mod[i].unity_qs_size; uq.vsync = g_mod[i].unity_qs_vsync;
+            LOG("main: Unity QualitySettings at [main+%#llx], vSyncCount at [+%#x] + [+%#x] * %#x + %#x", (unsigned long long)uq.ptr, uq.arr, uq.idx, uq.size, uq.vsync);
+        }
+        for (int k = 0; k < NSTEPS; k++) if (k_steps[k].build[0] && !strcmp(g_mod[i].build_id, k_steps[k].build)) {   // a step count: field = the count, scale = the mode field
+            const steps_row_t *S = &k_steps[k]; lock_t *L = &steps[k];
+            *L = (lock_t){ S->build, "framework step count", S->ptr_off, S->count, STEPS_I32, 1, S->mode, S->nderef, {S->deref[0], S->deref[1], S->deref[2]} };
+            rows[nrow++] = L; base = g_mod[i].base;
+        }
+    }
+    fb_find();
+    sk_find();
+}
+// Whether the host writes fps_target into an engine limiter of this main (a row for its build, NieR's frame interval, a target frame rate found by its readers, Unreal's variables or
+// fixed frame rate, Unity's frame rate, Monolith's interval, or Frostbite's simulation rate, found by name).
+// Without one, and without a frame step state page, nothing makes the game follow the cap, so the graphics layer keeps the game's own present interval (hle_nvn.c fps_present_cap):
+// presenting at a cap the game does not step by runs a fixed-step game fast or slow (Tears of the Kingdom 1.4.2 at 2x with DM_FPS_TARGET=60)
+// A floor or a step count does not fix the rate on its own terms: the game still sets its present interval (at or above the floor; the step count, which at a cap below 60 is the cap's)
+static int floor_only(void) { for (int r = 0; r < nrow; r++) if (!follows_game(rows[r]->kind)) return 0; return (nrow > 0 || half_find()) && !nier && !fb.n && !uq.base && !sk.n; }
+int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return (nrow || nier || fb.n || uq.base || sk.n || half_find()) && !floor_only(); }
+int dm_fps_lock_floor(void) { pthread_once(&g_found, lock_find); for (int r = 0; r < nrow; r++) if (follows_game(rows[r]->kind)) return 1; return half_find() != NULL; }   // the game picks its interval at or above a floor the host writes, or by the step count it writes
+static int steps_row(void) { pthread_once(&g_found, lock_find); for (int r = 0; r < nrow; r++) if (rows[r]->kind == STEPS_I32) return 1; return 0; }
+// The cap: DM_FPS_TARGET or the profile's fps_target at start, then whatever the front end sets while the game runs (dm_fps_target_set: the Android launcher's in-game panel,
+// DM_CTL "fps <n>"). 0 = the game's own; else 15, 20, 30, 40, 45 or 60, each applied by the limiters that can hold it (rate_ok)
+static int target_ok(int t) { return t == 0 || t == 15 || t == 20 || t == 30 || t == 40 || t == 45 || t == 60; }
+static _Atomic int g_target = -1, g_target_gen; static const char *g_target_src;
+__attribute__((weak)) uint8_t *dm_fps_state;   // loader.c: the frame step state page (NULL without a frame step); the unit tests have no loader
+void dm_fps_step_fold(void);   // below: the frame limit folded into the frame step's cap
+int dm_fps_target(void) {
+    int t = atomic_load(&g_target);
+    if (t >= 0) return t;
+    const char *e = getenv("DM_FPS_TARGET"); t = e ? atoi(e) : DM_GAME_FPS_TARGET;
+    if (!target_ok(t)) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 15, 20, 30, 40, 45 or 60; leaving the game's frame limit", e); t = 0; }
+    int was = -1;
+    if (atomic_compare_exchange_strong(&g_target, &was, t)) g_target_src = e ? "DM_FPS_TARGET" : "game profile fps_target";
+    return atomic_load(&g_target);
+}
+int dm_fps_target_gen(void) { return atomic_load(&g_target_gen); }
+int dm_fps_half_on(void) { return half_find() && dm_fps_target() == 30; }
+void dm_fps_target_set(int t, const char *src) {
+    if (!target_ok(t)) { LOG("[RED] frame rate cap %d (%s): must be 0, 15, 20, 30, 40, 45 or 60; unchanged", t, src); return; }
+    dm_fps_target(); g_target_src = src; atomic_store(&g_target, t); atomic_fetch_add(&g_target_gen, 1);
+    LOG("frame rate cap %d%s (%s)", t, t ? " fps" : " (the game's own)", src);
+    // A frame step (loader.c dm_fps_state_apply) reads its cap from the state page at every frame: 0, 30 and 60 go there too (with the frame limit folded in, dm_fps_step_fold)
+    if (dm_fps_state) {
+        if (t == 0 || t == 30 || t == 60) dm_fps_step_fold();
+        else LOG("[RED] frame rate cap %d: this game's frame step holds 30 or 60 only; its cap stays until the next start", t);
+    }
+}
+// The object a row's field is in, or 0 while the game has not made it yet
+static uint64_t row_obj(const lock_t *L) {
+    uint64_t obj = (uint64_t)(uintptr_t)base;
+    if (!L->ptr_off) return obj;
+    if (!rd((uint64_t)(uintptr_t)(base + L->ptr_off), &obj, sizeof obj) || !obj) return 0;
+    for (int i = 0; i < L->nderef; i++) if (!rd(obj + L->deref[i], &obj, sizeof obj) || !obj) return 0;
+    return obj;
+}
+// A floor row's controller maximum (the int32 after the floor, set by the game), or 0 while the game has not made the controller or set it
+static int floor_max(const lock_t *L) {
+    uint64_t obj = row_obj(L); int32_t mx;
+    if (!obj || !rd(obj + L->field + 4, &mx, sizeof mx) || mx < 1 || mx > 60) return 0;
+    return mx;
+}
+// Whether a row can hold cap t: its kind's rates (rate_ok), and for a floor no more vsyncs than the controller's own maximum (while that is unknown, the write waits for it)
+static int row_holds(const lock_t *L, int t) {
+    if (!rate_ok(L->kind, t)) return 0;
+    int mx = L->kind == MIN_VSYNCS_I32 ? floor_max(L) : L->kind == STEPS_I32 ? STEPS_MAX : 0;
+    return !mx || 60 / t <= mx;
+}
+static int holds(int t) {
+    int ok = ((nier || uq.base) && 60 % t == 0 && 60 / t <= 4) || fb.n || half_holds(t) || (sk.n && (t == 20 || t == 30 || t == 60));   // Shin'en's frame skip: whole vsyncs the debt holds
+    for (int r = 0; r < nrow && !ok; r++) ok = row_holds(rows[r], t);
+    return ok;
+}
+// Which caps this main's limiters hold, as a bit per rate (bit 0: 15, 1: 20, 2: 30, 3: 40, 4: 45, 5: 60); 0 = none, the game keeps its own frame rate
+static const int k_rates[] = {15, 20, 30, 40, 45, 60};
+int dm_fps_lock_rates(void) {
+    pthread_once(&g_found, lock_find);
+    int m = 0;
+    for (int i = 0; i < 6; i++) if (holds(k_rates[i])) m |= 1 << i;   // a floor's maximum is read each time: the panel asks again while the game runs
+    return m;
+}
+// sead's dynamic interval controller (a floor row's object: Donkey Kong Bananza main+0x204a18) at a 60 cap, on a device whose GPU clocks up only under steady load (the
+// Odin 2 Portal's Adreno 740 at 401 of 680 MHz). The controller steps to a longer interval after +0x0c consecutive late frames (the game's 2) and back only when its
+// cooldown +0x4c, refilled from +0x10, has counted down on frames that fit the shorter interval. At a low clock no frame fits 60, so once at 30 it stays there and
+// the GPU, now idle half the time, never clocks up: the trap. Two writes break it:
+// - patience: +0x0c late frames before stepping down, as many as DM_FPS_PATIENCE seconds (default 3, what the GPU governor needs to raise the clock; 0 leaves the
+//   game's) take at the presents' real rate, kept between the game's own count and 180. Counted in time, not frames: the game steps its logic by the interval, so
+//   late frames at interval 1 run it slow, and 180 frames of a 20 fps scene were 9 s of slow motion;
+// - retry: after DM_FPS_RETRY seconds (default 10; 0 = never) above the floor, the cooldown to 0 and the next shorter interval (+0x44) to one step shorter than now,
+//   so the controller tries the next faster rate (20 → 30, 30 → 60) on its next frame and the GPU gets the load that clocks it up. One step at a time: the same trap
+//   holds a light scene at 20 (a 2,000-draw area of Donkey Kong Bananza at 475-550 MHz), and a jump from 20 straight to 60 failed in heavy ones (8,000 draws)
+// Decoupling the game's speed from its present interval (DM_FPS_DECOUPLE, default 1; Android only): the controller hands the framework a frame rate of 60 / interval
+// (framework+0xe0, through main+0x204c60 in Donkey Kong Bananza v458752), and the game steps its world by that rate: a frame presented late at interval 1 (54 fps on
+// screen) still advanced the world 1/60 s, so the game ran slow. The framework's own VRR controller (main+0x204640, taken only on a display that reports VRR) hands
+// it the measured rate in the same field; this does the same in the interval controller. The rewriter puts observation gate OBS_SEAD_RATE on the controller's
+// sdiv of 60 by the interval in the main of a game whose profile opts in (fps_decouple sead; dm/tools/nso_code.py sead_find: found by its code, no build ID; a profile's OBS row names it for a build), with the
+// dividend N, the divisor M (the interval) and the controller's register C in the gate number's upper bits. The callback writes N = rate * M, so the sdiv yields the
+// rate, and the controller stores it and hands it to the framework as it would its own. Measured on the Portal (2026-11-05, the earlier form that loaded the rate
+// from the controller): at interval 1 in a 20 fps area a half-second walk went as far as at the game's own interval 3, where without this it went a third of that.
+// The rate is a whole number of frames a second (the field is an int32), the game's time step 1 / rate. It is the time between this frame's start and the last
+// one's (the presents between two calls, so a frame the controller skips does not count twice), with the rounding error carried to the next frame: at 20.4 fps the
+// rates alternate 20 and 21 so that the steps add up to the time that passed. Clamped to 10..60: below 10 fps the game slows down, as on the Switch, and the debt is
+// dropped after a long frame (a load), so the game does not run ahead to catch up. sead_rate_log every 10 s: the game time handed out against the time that passed
+#define SEAD_RATE_MIN 10
+#define SEAD_RATE_MAX 60
+static _Atomic uint32_t g_presents;   // presents so far (dm_fps_lock_tick)
+// The rate for a frame of dt seconds with the carried rounding error *debt (seconds of real time not yet stepped), and the debt after it
+static int32_t sead_rate_pick(double dt, double *debt) {
+    double want = dt + *debt;
+    int32_t r = want > 0 ? (int32_t)(1.0 / want + 0.5) : SEAD_RATE_MAX;
+    if (r < SEAD_RATE_MIN) r = SEAD_RATE_MIN;
+    if (r > SEAD_RATE_MAX) r = SEAD_RATE_MAX;
+    *debt = want - 1.0 / r;
+    if (*debt > 1.0 / SEAD_RATE_MAX) *debt = 0;   // a frame longer than the floor's: the game slows down, and does not catch up afterwards
+    if (*debt < -1.0 / SEAD_RATE_MAX) *debt = -1.0 / SEAD_RATE_MAX;
+    return r;
+}
+static struct { uint64_t ctl; double debt, game_s, wall_s; uint32_t presents, frames; struct timespec last, last_log; int32_t rate; } g_sr;
+// On or off: the Android launcher's "Full game speed at low frame rates" (Game settings, and the in-game panel live: nxhost_fps_decouple_set), else DM_FPS_DECOUPLE
+// at the first frame (default on; the launcher passes DM_FPS_DECOUPLE=0 for a start with the setting off). Off, the gate leaves the controller's 60 / interval as it is
+// (the game's own step; the pin still holds interval 1 where presentation follows the host's tick, sead_pin_wanted); on again, it starts from a fresh measurement. Read at every frame, so a change applies at the next one
+static _Atomic int g_decouple = -1;
+static const char *g_decouple_src;
+__attribute__((visibility("default"))) void nxhost_fps_decouple_set(int on) {
+    atomic_store(&g_decouple, on != 0); g_decouple_src = "the launcher's in-game panel";
+    LOG("main: frame rate decoupling %s (%s)", on ? "on" : "off", g_decouple_src);
+}
+static int sead_rate_on(void) {
+    int v = atomic_load(&g_decouple);
+    if (v >= 0) return v;
+    const char *e = getenv("DM_FPS_DECOUPLE"); int was = -1;
+    v = !e || atoi(e) != 0;
+    if (atomic_compare_exchange_strong(&g_decouple, &was, v)) { g_decouple_src = e ? "DM_FPS_DECOUPLE" : "default"; if (!v) LOG("main: frame rate decoupling off (DM_FPS_DECOUPLE=0)"); }
+    return atomic_load(&g_decouple);
+}
+int dm_fps_decouple_on(void) { return sead_rate_on(); }   // the same setting for a game's own speed gate, read at every frame (android/mtf_speed.c: Mario Tennis Fever's draw flag)
+// The gate's work at time now (the unit tests call it with their own clock): regs x0..x29 as the gate saved them, param N | M << 5 | C << 10
+static void sead_rate_at(uint64_t *r, int param, struct timespec now) {
+    int n = param & 31, m = (param >> 5) & 31, c = (param >> 10) & 31; static int nlog;
+    if (n > 28 || m > 28 || c > 28) return;
+    int32_t interval = (int32_t)r[m];
+    g_sr.ctl = r[c];
+    uint32_t pr = atomic_load(&g_presents), frames = pr - g_sr.presents; g_sr.presents = pr;
+    struct timespec last = g_sr.last; g_sr.last = now;
+    if (!last.tv_sec && !last.tv_nsec) { g_sr.last_log = now; return; }   // the first frame: its own 60 / interval
+    if (interval < 1 || interval > 8) return;   // not an interval: the game's own division
+    double dt = (double)(now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
+    if (frames > 1) dt /= frames;
+    int32_t rate = sead_rate_pick(dt, &g_sr.debt);
+    r[n] = (uint32_t)(rate * interval);   // sdiv wD, wN, wM: rate * interval / interval
+    g_sr.rate = rate; g_sr.frames++; g_sr.game_s += 1.0 / rate; g_sr.wall_s += dt * (frames > 1 ? frames : 1);
+    if (!nlog++) LOG("main: frame rate decoupled from the present interval: sead's controller (%#llx) hands the game the measured rate (now %d fps, interval %d) instead of 60 / interval (DM_FPS_DECOUPLE)",
+                     (unsigned long long)g_sr.ctl, rate, interval);
+    double since = (double)(now.tv_sec - g_sr.last_log.tv_sec) + (now.tv_nsec - g_sr.last_log.tv_nsec) / 1e9;
+    if (since >= 10) {   // the check of full speed: game time = wall time, whatever the frame rate
+        LOG("main: sead rate: %.2f s of game time in %.2f s (%.1f%%), %u frames, %.1f fps, rate now %d", g_sr.game_s, g_sr.wall_s, g_sr.wall_s > 0 ? 100 * g_sr.game_s / g_sr.wall_s : 0,
+            g_sr.frames, g_sr.wall_s > 0 ? g_sr.frames / g_sr.wall_s : 0, rate);
+        g_sr.game_s = g_sr.wall_s = 0; g_sr.frames = 0; g_sr.last_log = now;
+    }
+}
+// OBS_SEAD_RATE: on the game's main thread, once a frame, before the controller's sdiv. Also holds the controller's longest interval at 1 where the interval does not
+// pace the game (sead_pin)
+static void sead_pin(uint64_t ctl, int on);
+static int limit_raw(void);
+// Whether the controller's longest interval is held at 1. Wherever presentation follows the host's tick (DM_PRESENT_INTERVAL=display, the Android default of the profiles
+// that set it) with no frame rate cap, a frame lasts 1/60 s on screen whatever interval the game picked, so the game must not step 1/30 s (60 / 2) for it: that was the 2x
+// speed phases of #207 (Donkey Kong Bananza; the controller flips 1 <-> 2 after a few late frames). This holds whether or not Full game speed (decoupling) is on: decoupling
+// only changes the step's dividend (the measured rate), the pin keeps it from being the interval's. 0.2.4 pinned unconditionally; 0.2.9 (ad509ad8) made the pin follow
+// the setting, so off released it: the regression. Left free: a cap (dm_fps_target), where the cap's interval is the right step, and, with decoupling off, a frame limit below
+// 60 (the limiter then holds the presents to 30 or 40 and the game's own 60 / interval at its longer interval is the right step; interval 1 would run it slow). With decoupling
+// on, the measured rate is the step whatever the limit, so the limit does not matter
+static int g_sead_display = -1;   // the unit tests reset it
+static int sead_pin_wanted(int decoupled) {
+    if (g_sead_display < 0) { const char *m = getenv("DM_PRESENT_INTERVAL"); g_sead_display = m ? !strcmp(m, "display") : DM_GAME_PRESENT_DISPLAY; }
+    if (!g_sead_display || dm_fps_target() != 0) return 0;
+    int l = limit_raw();
+    return decoupled || l == 0 || l >= 60;
+}
+static void sead_rate_gate(uint64_t *r, int param, struct timespec now) {   // the gate's work, the platform aside (the unit tests call it)
+    int c = (param >> 10) & 31;
+    if (!sead_rate_on()) {   // off: the game's own 60 / interval (no measured rate), at interval 1 where the host presents on its own tick (sead_pin_wanted)
+        g_sr.last = (struct timespec){0}; g_sr.debt = 0;
+        if (c <= 28 && r[c]) sead_pin(r[c], sead_pin_wanted(0));
+        return;
+    }
+    sead_rate_at(r, param, now);
+    if (g_sr.ctl) sead_pin(g_sr.ctl, sead_pin_wanted(1));
+}
+static void sead_rate(uint64_t *r, int param) {
+    if (!PLAT_ANDROID) return;   // Android only: elsewhere the game keeps its own division
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    sead_rate_gate(r, param, now);
+}
+__attribute__((constructor)) static void sead_rate_attach(void) { gate_obs_set(OBS_SEAD_RATE, sead_rate); }
+
+// Without a cap (the uncapped mode and the frame limiter's caps: presents on the host's own tick, the limiter pacing) the controller kept the game's tuning: two late
+// frames moved it to a longer interval, six frames later it tried the shortest again. Each switch back to interval 1 let the game start its next frame without waiting:
+// two frames of GPU work queued, the one after waited up to ~100 ms, and the decoupling took one 60 fps measurement: a hitch about once a second (Donkey Kong Bananza at
+// 1080p, the controller flipping 3 and 1 several times a second, 2026-11-05). Here the interval does not pace the game (the GPU or the limiter does: 19-20 fps at
+// interval 1 and 3 alike), so its longest interval (+0x04) is held at 1 and the controller never switches; the game's own longest comes back with a cap that needs it.
+// Only where presentation follows the host's tick (DM_PRESENT_INTERVAL=display, the launcher's frame limit): where the interval paces the presents, interval 1 would trade a
+// steady 30 for an uneven rate. The controller is the one the gate saw (sead_rate). DM_FPS_PIN=0 off
+#ifndef DM_TEST_PIN
+#define DM_TEST_PIN 0
+#endif
+static int32_t g_pin_orig;
+static void sead_pin(uint64_t ctl, int on) {
+    static int en = -1, nlog;
+    if (en < 0) { const char *e = getenv("DM_FPS_PIN"); en = (PLAT_ANDROID || DM_TEST_PIN) && (!e || atoi(e) != 0); }   // Android only, like the rest of this pacing (DM_TEST_PIN: the unit tests run the pin on the Mac)
+    int32_t v[2]; if (!rd(ctl, v, sizeof v) || v[0] < 1 || v[1] < 1 || v[1] > 8) return;   // +0 shortest, +4 longest interval
+    int32_t *p = (int32_t *)(uintptr_t)(ctl + 4);
+    if (on && en) {
+        if (v[1] != 1) { g_pin_orig = v[1]; dm_guest_write_prepare(p, 4); __atomic_store_n(p, 1, __ATOMIC_RELAXED);
+                         if (nlog++ < 4) LOG("main: frame-rate controller held at interval 1 (its longest was %d): the GPU or the frame limiter paces the game (DM_FPS_PIN)", g_pin_orig); }
+    } else if (g_pin_orig && v[1] == 1) { dm_guest_write_prepare(p, 4); __atomic_store_n(p, g_pin_orig, __ATOMIC_RELAXED); LOG("main: frame-rate controller's longest interval back to %d", g_pin_orig); g_pin_orig = 0; }
+}
+
+static void sead_ctl_tune(uint64_t ctl, int target, const char *src) {
+    static int retry_s = -1, nlog, nretry; static float patience_s = -1, frame_s; static int32_t game_patience; static struct timespec slow_since, last_tick; static int slow;
+    if (!PLAT_ANDROID) return;   // the GPU clock trap this works around was measured on Android phones; the Mac and iOS keep the game's own tuning
+    if (patience_s < 0) { const char *e = getenv("DM_FPS_PATIENCE"); patience_s = e ? (float)atof(e) : 3; e = getenv("DM_FPS_RETRY"); retry_s = e ? atoi(e) : 10; }
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last_tick.tv_sec) {   // the presents' real interval (this runs once a present), smoothed over about 30 presents
+        float dt = (float)((now.tv_sec - last_tick.tv_sec) + (now.tv_nsec - last_tick.tv_nsec) / 1e9);
+        if (dt > 0 && dt < 0.5f) frame_s = frame_s ? frame_s + (dt - frame_s) / 30 : dt;
+    }
+    last_tick = now;
+    int32_t v[0x14]; if (!rd(ctl, v, sizeof v)) return;   // +0x00 .. +0x4c
+    int32_t floor_ = v[0], late = v[3], interval = v[0x10], lower = v[0x11];
+    if (floor_ < 1 || interval < 1 || interval > 4) return;   // not set up yet
+    if (target != 60) {   // the game's own patience back, for caps that hold a longer interval anyway
+        if (game_patience && late != game_patience) { int32_t *p = (int32_t *)(uintptr_t)(ctl + 0xc); dm_guest_write_prepare(p, 4); __atomic_store_n(p, game_patience, __ATOMIC_RELAXED); }
+        slow = 0; return;
+    }
+    if (patience_s > 0 && frame_s > 0 && late >= 1 && late <= 1000) {
+        if (!game_patience) game_patience = late;
+        int32_t want = (int32_t)(patience_s / frame_s + 0.5f);
+        if (want > 180) want = 180;
+        if (want < game_patience) want = game_patience;
+        if (want != late && (want - late > 4 || late - want > 4 || want == game_patience)) {   // a few frames either way is not worth a write
+            int32_t *p = (int32_t *)(uintptr_t)(ctl + 0xc); dm_guest_write_prepare(p, 4); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+            if (nlog++ < 6) LOG("main: frame-rate controller patience %d → %d late frames (%.1f s at %.1f fps; DM_FPS_PATIENCE; %s)", late, want, patience_s, 1 / frame_s, src);
+        }
+    }
+    if (retry_s <= 0) return;
+    if (interval <= floor_) { slow = 0; return; }
+    if (!slow) { slow = 1; slow_since = now; return; }
+    if ((now.tv_sec - slow_since.tv_sec) + (now.tv_nsec - slow_since.tv_nsec) / 1e9 < retry_s) return;
+    int32_t *lo = (int32_t *)(uintptr_t)(ctl + 0x44), *cd = (int32_t *)(uintptr_t)(ctl + 0x4c);
+    int32_t step = interval - 1 > floor_ ? interval - 1 : floor_;
+    dm_guest_write_prepare(lo, 4); __atomic_store_n(lo, step, __ATOMIC_RELAXED);
+    dm_guest_write_prepare(cd, 4); __atomic_store_n(cd, 0, __ATOMIC_RELAXED);
+    if (nretry++ < 20) LOG("main: frame-rate controller at interval %d for %d s: trying interval %d (was next %d; DM_FPS_RETRY)", interval, retry_s, step, lower);
+    slow_since = now;
+}
+
+// The host's frame limiter: it holds the game to at most a limit's frames a second, waiting on the game's thread before the present until 1 / limit after the previous
+// frame's deadline; a frame that comes late starts a new schedule. For games whose speed follows the measured frame rate (sead_rate) it is the frame rate cap: with the
+// present interval no longer pacing the game (DM_PRESENT_INTERVAL=display) the game runs as fast as it can. For any other game it is a cap below the game's own rate: the
+// game keeps its present interval, so it is right only for a game whose logic steps by the time between frames (a game that counts frames would run slow); a steady
+// frame time and less heat in place of a rate that wanders below the game's own.
+// The limit: the launcher's in-game panel while the game runs (nxhost_fps_limit_set), else DM_FPS_LIMIT (the launcher's choice at start, or the player's own line),
+// else the profile's fps_limit (Android only); 0 = none. Only Android waits (fps_limit_wait)
+static _Atomic int g_fps_limit = -1; static const char *g_fps_limit_src;
+void dm_fps_step_fold(void);
+__attribute__((visibility("default"))) void nxhost_fps_limit_set(int fps) { atomic_store(&g_fps_limit, fps > 0 ? fps : 0); g_fps_limit_src = "the launcher's in-game panel"; LOG("main: frame limit %d fps%s", fps, fps > 0 ? "" : " (none)"); dm_fps_step_fold(); }
+static int fps_limit_start(void) {
+    const char *e = getenv("DM_FPS_LIMIT"); int l = e ? atoi(e) : PLAT_ANDROID ? DM_GAME_FPS_LIMIT : 0;
+    if (l < 0) l = 0;
+    int was = -1;
+    if (atomic_compare_exchange_strong(&g_fps_limit, &was, l)) { g_fps_limit_src = e ? "DM_FPS_LIMIT" : "game profile fps_limit"; if (l) LOG("main: frame limit %d fps (%s)", l, g_fps_limit_src); }
+    return atomic_load(&g_fps_limit);
+}
+static int limit_raw(void) { int l = atomic_load(&g_fps_limit); if (l < 0) l = fps_limit_start(); return l > 0 ? l : 0; }
+// A game with a frame step (the rewriter's stubs, a state page: loader.c) steps its game time by the vsyncs the host hands it each frame (hle_nvn.c fstep_tick). The limiter
+// alone held such a game's frames to the limit while the game went on stepping by its own interval: Ocarina of Time (0400486024DEC000) kept interval 1 (1/60 s a frame) at
+// the profile's 30 fps limit and ran at half speed, and at 25 fps uncapped at 0.4. So for such a game the limit is the frame step's cap, in whole vsyncs: 60, 30 or 20 fps
+// (the step's 1, 2 or 3 vsyncs; FSTEP_MAX is 3); a limit between them is held at the whole-vsync rate below it (45 and 40: 30 fps, with game time = real time), and the
+// frame step paces the presents, so the limiter does not wait as well (its wait would count in the step's cost and look like late frames). Below 20 the limiter waits as
+// before (a step of 4 vsyncs is not one the games' own logic uses). 0 = no limit, or no frame step. A framework's step count (a profile's fps_steps row, steps_tick) holds the limit the
+// same way: its steps a frame and its present interval are the limit's vsyncs
+static int limit_step(int l) { return l >= 60 ? 60 : l >= 30 ? 30 : l >= 20 ? 20 : 0; }
+int dm_fps_limit_step(void) { return dm_fps_state || steps_row() ? limit_step(limit_raw()) : 0; }
+// The frame step's cap in the state page (+0, float; 0 = the stubs run the game's own logic): the frame rate cap (fps_target, the in-game panel's cap) and the frame limit's
+// step, whichever is lower. The stubs know 30 and 60 (several compare with 30.0): a 20 fps limit writes 30 there, and hle_nvn.c fps_step_cap takes the 20 from dm_fps_limit_step
+void dm_fps_step_fold(void) {
+    if (!dm_fps_state) return;
+    uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float was; memcpy(&was, &b, sizeof was);
+    int t = dm_fps_target(), l = dm_fps_limit_step(), c = t == 30 || t == 60 ? t : 0;
+    if (l && (!c || l < c)) c = l;
+    float f = c ? (c < 30 ? 30.0f : (float)c) : 0.0f;
+    __atomic_store_n((uint32_t *)dm_fps_state, *(uint32_t *)&f, __ATOMIC_RELAXED);
+    if (f != was || l) {
+        static int n; if (n++ < 16) {
+            int raw = limit_raw();
+            if (l) LOG("main: frame limit %d fps held by the frame step at %d fps (%d vsync%s a frame%s; frame rate cap %d)", raw, l, 60 / l, l == 60 ? "" : "s", raw != l ? ", the whole-vsync rate below the limit" : "", t);
+            else LOG("main: frame step cap %g (%s)", f, f ? "fps" : "the game's own");
+        }
+    }
+}
+int nxhost_fps_limit_get(void) { int s = dm_fps_limit_step(); return s ? s : limit_raw(); }   // the rate the limit holds (0: none; a frame-step game's whole-vsync rate); probe.c aims the dynamic resolution at it, frame generation fits its frames to it
+// The active pre-frame-generation cap (0 = uncapped): the lower positive rate of the host frame limiter and an active engine cap
+int dm_fps_cap_get(void) {
+    int l = nxhost_fps_limit_get();
+    int t = (dm_fps_state || dm_fps_lock_engine() || dm_fps_lock_floor()) ? dm_fps_target() : 0;
+    return l > 0 && (!t || l < t) ? l : t;
+}
+// Whether the game's speed follows its measured frame rate (the rewriter gated sead's controller in this main, DM_FPS_DECOUPLE not 0): frame generation's pacer then takes any base rate
+// above its floor (a slower base does not slow the game), where a game held by the limiter alone steps as it would at that rate
+int nxhost_fps_decoupled(void) {
+    pthread_once(&g_found, lock_find);
+    return PLAT_ANDROID && gate_obs_present(OBS_SEAD_RATE) && sead_rate_on();   // live: the in-game panel may turn it off
+}
+static void fps_limit_wait(void) {
+    if (!PLAT_ANDROID) return;   // only the Android launcher sets a frame limit
+    int lim = limit_raw();
+    static uint64_t next;
+    if (!lim || dm_fps_limit_step()) { next = 0; return; }   // none, or the frame step holds it (dm_fps_limit_step)
+    uint64_t now = plat_abs_time(), period = 1000000000ull / (uint64_t)lim;   // the platform's monotonic clock and sleep (plat.h): clock_nanosleep is Linux only
+    if (next > now && next - now <= period) { plat_wait_until(next); now = next; }
+    next = (next > now || (next && now - next < period / 2) ? next : now) + period;   // keep the phase through small lateness, restart after a long frame
+}
+
+// A step count row (STEPS_I32, a profile's fps_steps): the cap, and the frame limit's whole-vsync rate if lower (dm_fps_limit_step), as the framework's steps a frame. n steps of
+// 1/60 s each frame at 60 / n fps is game time = real time; the framework's present interval follows the count, so presentation needs nothing more (dm_fps_lock_engine leaves the
+// row out: the game's own interval stays). 1 step (60, or no cap): the game's own mode, which runs 2 steps on a frame its work overran (full speed below 60, as on the Switch).
+// 2: the mode that picks 2, the game's own 30 fps form. 3: STEPS_HOLD and the count 3 (the game's mode adjustments for 30 fps, made where the mode is 2, then take their 60 fps
+// values; README of the game). The mode the game had is given back when the cap goes up again; one it sets meanwhile (a scene's setup) is the one given back, and the host's
+// goes in again over it while the cap holds. One frame may run the game's own pick at a change: the gate is the game's own procFrame, which reads the mode before the count
+// Hold 60 fps (DM_FPS_HOLD60=1 at start, the Android launcher's Game settings; its in-game panel live: nxhost_fps_hold60_set): with no cap below 60, where the game's own
+// mode is 0 (2 steps on a frame its work overran: a drop to 30 fps at the first long frame, Mario Kart World's free roam), the host writes mode 1, one step every frame. A long
+// frame then plays slower (one 1/60 s step for a longer frame) instead of halving the frame rate. The game's own other modes stay (2: its 30 fps form for three or four players)
+static _Atomic int g_hold60 = -1;
+__attribute__((visibility("default"))) void nxhost_fps_hold60_set(int on) { atomic_store(&g_hold60, on != 0); LOG("main: hold 60 fps %s (the launcher's in-game panel)", on ? "on" : "off"); }
+static int hold60_on(void) {
+    int v = atomic_load(&g_hold60);
+    if (v >= 0) return v;
+    const char *e = getenv("DM_FPS_HOLD60"); int was = -1; v = e && atoi(e) > 0;
+    if (atomic_compare_exchange_strong(&g_hold60, &was, v) && v) LOG("main: hold 60 fps on (DM_FPS_HOLD60=1): one framework step a frame where the game's own mode would drop to 30 fps");
+    return atomic_load(&g_hold60);
+}
+// The host's frame step (hle_nvn.c fstep_hold, a game with FRAME_STEP stubs: Ocarina of Time) takes Hold 60 fps as fps_hold off: frames are not held longer than the cap's
+// vsyncs, each shown as soon as it is ready, and a late frame's time is paid back one extra step a frame (game time = real time down to 30 fps) instead of the hold going to 2
+int dm_fps_hold60(void) { return PLAT_ANDROID && hold60_on(); }
+static struct { int32_t game, mine; uint8_t ours; int nlog; } g_st[NROWS];   // ours: the mode in is the host's (mine); game: the game's own, given back
+static int steps_cap(int target) { int c = limit_step(target), l = limit_step(limit_raw()); return l && (!c || l < c) ? l : c; }
+static void steps_tick(const lock_t *L, int r, int target, const char *src) {
+    uint64_t obj = row_obj(L); int32_t cur, cnt;
+    if (!obj || !rd(obj + L->scale, &cur, sizeof cur) || !rd(obj + L->field, &cnt, sizeof cnt)) return;   // not made yet
+    int c = steps_cap(target), n = c ? 60 / c : 1, want = n == 2 ? 2 : STEPS_HOLD;
+    int32_t *mode = (int32_t *)(uintptr_t)(obj + L->scale), *count = (int32_t *)(uintptr_t)(obj + L->field);
+    if (g_st[r].ours && cur != g_st[r].mine) g_st[r].ours = 0;   // the game set its own since (a scene's setup): that is the one to give back
+    if (!g_st[r].ours) g_st[r].game = cur;
+    if (n <= 1) want = hold60_on() && g_st[r].game == 0 ? 1 : -1;   // 60 or no cap: the game's own mode, or one step a frame where its own is 0 (Hold 60 fps)
+    if (want >= 0) {
+        if (want == STEPS_HOLD && cnt != n) { dm_guest_write_prepare(count, sizeof *count); __atomic_store_n(count, n, __ATOMIC_RELAXED); }   // the count before the mode that keeps it
+        if (cur != want) {
+            dm_guest_write_prepare(mode, sizeof *mode); __atomic_store_n(mode, want, __ATOMIC_RELAXED); g_st[r].ours = 1; g_st[r].mine = want;
+            if (g_st[r].nlog < 16) { g_st[r].nlog++; LOG("main: %s %d a frame at %d fps: its mode %d → %d (%s%s%s)", L->what, n, c ? c : 60, cur, want, src, want == 1 ? ", hold 60 fps" : "", c != limit_step(target) ? "; held by the frame limit" : ""); }
+        }
+    } else if (g_st[r].ours) {
+        dm_guest_write_prepare(mode, sizeof *mode); __atomic_store_n(mode, g_st[r].game, __ATOMIC_RELAXED); g_st[r].ours = 0;
+        if (g_st[r].nlog < 16) { g_st[r].nlog++; LOG("main: %s back to the game's own mode %d (%s)", L->what, g_st[r].game, src); }
+    }
+}
+
+// The draw-every-other-step flag at the cap (k_half above): on at 30, the host's own bit off again at any other cap; a cap the game holds no other way becomes the game's own
+static void half_tick(void) {
+    uint8_t *p = half_find();
+    if (!p) return;
+    int t = dm_fps_target(); uint8_t m = g_half.mask, cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    if (t && !holds(t)) {
+        if (g_half.refused != t) { g_half.refused = t; LOG("main: frame rate cap %d fps (%s) is not one this game can hold (its engine draws every step or every other one: 60 or 30): the game's own frame rate instead", t, g_target_src ? g_target_src : "?"); }
+        dm_fps_target_set(0, "a cap this game cannot hold"); t = 0;
+    }
+    if (t == 30 && !(cur & m)) {
+        dm_guest_write_prepare(p, 1); __atomic_fetch_or(p, m, __ATOMIC_RELAXED); g_half.ours = 1;
+        if (g_half.nlog < 16) { g_half.nlog++; LOG("main: the engine draws every other step at 30 fps, 60 steps a second: its flag set (%s)", g_target_src ? g_target_src : "?"); }
+    } else if (t != 30 && (cur & m) && g_half.ours) {
+        dm_guest_write_prepare(p, 1); __atomic_fetch_and(p, (uint8_t)~m, __ATOMIC_RELAXED); g_half.ours = 0;
+        if (g_half.nlog < 16) { g_half.nlog++; LOG("main: the engine draws every step again: its flag cleared (%s)", g_target_src ? g_target_src : "?"); }
+    } else if (!(cur & m)) g_half.ours = 0;   // the game cleared it itself
+}
+
+void dm_fps_lock_tick(void) {
+    fps_limit_wait();
+    atomic_fetch_add_explicit(&g_presents, 1, memory_order_relaxed);   // sead_rate's frame count
+    dynamic_resolution_tick();   // separate from the FPS cap
+    half_tick();   // before the rows: its module may not be main, and it needs none of them
+    static int state = -2, nlog[NROWS], target, gen = -1, start_cap; static const char *src; static uint8_t over[NROWS];
+    static uint32_t orig[NROWS][2]; static uint8_t have_orig[NROWS][2];   // what a row held before the host first wrote it: put back when the cap goes to 0 while the game runs
+    if (state == -1) return;
+    if (state == -2) {
+        pthread_once(&g_found, lock_find);
+        if (!nrow && !nier && !fb.n && !uq.base && !sk.n && !ue_missing) { state = -1; return; }
+        int t = dm_fps_target();
+        if (t && ue_missing) LOG("[RED] main: Unreal %s not found by the rewriter (ue_cvar.py NAMES; game profile ue_fps_cvar): the game's own frame limit stays", DM_GAME_UE_FPS_CVAR);
+        if (!nrow && !nier && !fb.n && !uq.base && !sk.n) { state = -1; return; }
+        state = 0;
+    }
+    int g = dm_fps_target_gen();
+    if (g != gen) {   // the start, or a cap set while the game runs
+        int first = gen < 0, t = dm_fps_target(); gen = g; src = g_target_src;
+        if (!t) {
+            if (first) { for (int r = 0; r < nrow; r++) LOG("main: %s left as the game sets it (%s)", rows[r]->what, src); if (nier) LOG("main: NieR frame interval left as the game sets it (%s)", src);
+                         if (fb.n) LOG("main: Frostbite simulation rate left as the game sets it (%s)", src); if (uq.base) LOG("main: Unity vSyncCount left as the game sets it (%s)", src); }
+            else if (uq.base) unity_vsync_restore(src);
+            if (!first) for (int r = 0; r < nrow; r++) {   // back to the game's own: the values the game had before the host wrote them (NieR and Frostbite keep the last cap until the game sets them again)
+                uint64_t obj = row_obj(rows[r]); if (!obj) continue;
+                if (rows[r]->kind == EXTRA_VSYNCS_U8) {   // the two bytes the game had (least 0, most 1 in play)
+                    if (have_orig[r][0]) { uint16_t *p = (uint16_t *)(uintptr_t)(obj + rows[r]->field); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, (uint16_t)orig[r][0], __ATOMIC_RELAXED);
+                                           LOG("main: %s back to the game's least %u most %u (%s)", rows[r]->what, orig[r][0] & 0xff, (orig[r][0] >> 8) & 0xff, src); }
+                    continue;
+                }
+                for (int c = 0; c < rows[r]->copies && c < 2; c++) if (have_orig[r][c] && rows[r]->kind != FPS_F64) {
+                    uint32_t *p = (uint32_t *)(uintptr_t)(obj + rows[r]->field + 4 * (uint64_t)c); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, orig[r][c], __ATOMIC_RELAXED);
+                    int k = rows[r]->kind; float fv; memcpy(&fv, &orig[r][c], sizeof fv);
+                    if (k == FPS_F32 || k == MS_F32 || k == SECS_F32) LOG("main: %s back to the game's %g (%s)", rows[r]->what, fv, src);
+                    else LOG("main: %s back to the game's %u (%s)", rows[r]->what, orig[r][c], src);
+                }
+            }
+        }
+        else for (int r = 0; r < nrow; r++) if (!rate_ok(rows[r]->kind, t) && rows[r]->kind != STEPS_I32) LOG("main: %s cannot hold %d fps (whole vsyncs only): left as the game sets it (%s)", rows[r]->what, t, src);
+        target = t; start_cap = first && t;
+        if (!first) for (int r = 0; r < NROWS; r++) nlog[r] = over[r] = 0;
+    }
+    for (int r = 0; r < nrow; r++) if (rows[r]->kind == STEPS_I32) steps_tick(rows[r], r, target, src);   // every frame: the frame limit counts too, without a cap
+    if (sk.n) sk_tick(target, src);   // every frame: the frame limit counts too, and with no cap it gives the game its own type back
+    if (!target) {   // no cap: the decoupling and the pin run in sead_rate, the controller's own gate
+        // Without that gate in the pack (a pack the rewriter made before the profile opted in, or by a build that did not find the site) nothing else holds the pin, and the
+        // controller flipped 1 <-> 2 under the host's tick: the 2x speed phases of #207 again. The floor row names the same controller, so the pin is held from here
+        // with decoupling off (it cannot be on without the gate)
+        if (!gate_obs_present(OBS_SEAD_RATE)) for (int r = 0; r < nrow; r++) if (rows[r]->kind == MIN_VSYNCS_I32) { uint64_t obj = row_obj(rows[r]); if (obj) sead_pin(obj + rows[r]->field, sead_pin_wanted(0)); }
+        return;
+    }
+    // The cap at start (DM_FPS_TARGET: the Android panel's saved cap, env.txt; or the profile) may be one this game cannot hold: 15 on Donkey Kong Bananza, whose controller goes to
+    // 3 vsyncs at most. Once every floor's maximum is known, such a cap becomes 0, the game's own, so the front end and presentation show what the game really does
+    if (start_cap) {
+        int known = 1; for (int r = 0; r < nrow; r++) if (rows[r]->kind == MIN_VSYNCS_I32 && !floor_max(rows[r])) known = 0;
+        if (known) {
+            start_cap = 0;
+            if (!holds(target)) {
+                LOG("main: frame rate cap %d fps (%s) is not one this game can hold: the game's own frame rate instead", target, src);
+                dm_fps_target_set(0, "a start cap this game cannot hold"); return;
+            }
+        }
+    }
+    if (nier && 60 % target == 0) {
+        // NieR:Automata US/EU 1.0.3 (3c10ec35c5ef4c3686b4053afb0e58e7):
+        // - [base + 0x192be00] points to the NVN graphics device object whose +0x9c160 holds the present interval (1 = 60 FPS, 2 = 30 FPS),
+        //   and base + 0x192c304 (+0x504) holds the requested interval mode (0 = 60 FPS, 1 = 30 FPS).
+        // Resolution policy is applied independently above, so 30/60 FPS does
+        // not implicitly enable or disable the native resolution controller.
+        uint64_t p = 0; static int nlog_nier;
+        uint32_t want = (uint32_t)(60 / target), want_mode = want - 1, cur_mode = 0;
+        if (rd((uint64_t)(uintptr_t)(base + display + 0x504), &cur_mode, sizeof cur_mode) && cur_mode != want_mode && (cur_mode == 0 || cur_mode == 1)) {
+            uint32_t *dst = (uint32_t *)(uintptr_t)(base + display + 0x504);
+            dm_guest_write_prepare(dst, sizeof *dst);
+            __atomic_store_n(dst, want_mode, __ATOMIC_RELAXED);
+        }
+        if (rd((uint64_t)(uintptr_t)(base + display), &p, sizeof p) && p) {
+            uint64_t a = p + 0x9c160; uint32_t cur = 0;
+            if (rd(a, &cur, sizeof cur) && cur != want && (cur == 1 || cur == 2)) {
+                uint32_t *dst = (uint32_t *)(uintptr_t)a;
+                dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want, __ATOMIC_RELAXED);
+                if (nlog_nier++ < 8) LOG("main: NieR frame interval %u → %u (%d fps; %s)", cur, want, target, src);
+            }
+        }
+    }
+    if (fb.n) fb_tick(target, src);
+    if (uq.base && 60 % target == 0 && 60 / target <= 4) unity_vsync_tick(target, src);   // a count of whole vsyncs: 40 and 45 leave it (targetFrameRate, where found, takes them)
+    for (int r = 0; r < nrow; r++) {
+        const lock_t *L = rows[r]; if (!rate_ok(L->kind, target) || L->kind == STEPS_I32) continue;   // step counts: steps_tick
+        uint64_t obj = row_obj(L); if (!obj) continue;   // not created yet
+        if (L->flag) { uint8_t b; if (!rd(obj + (L->flag >> 8), &b, 1) || !(b & (L->flag & 0xff))) continue; }   // the object's flag is off (Unreal: no fixed frame rate in use)
+        if (L->kind == MIN_VSYNCS_I32) { sead_pin(obj + L->field, 0); sead_ctl_tune(obj + L->field, target, src); }
+        if (L->kind == FPS_F64) {
+            for (int c = 0; c < L->copies; c++) {
+                uint64_t a = obj + L->field + 8 * (uint64_t)c; double cur, want = target;
+                if (!rd(a, &cur, sizeof cur)) break;
+                if (cur == want || !(cur >= 10 && cur <= 120)) continue;   // already set, or not set yet
+                double *p = (double *)(uintptr_t)a;
+                dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint64_t *)p, *(uint64_t *)&want, __ATOMIC_RELAXED);
+                if (nlog[r] < 8) { nlog[r]++; LOG("main: %s%s %g → %d fps (%s)", L->what, L->copies > 1 ? (c ? " (reported rate)" : " (target)") : "", cur, target, src); }
+            }
+            continue;
+        }
+        if (L->kind == EXTRA_VSYNCS_U8) {   // the least and the most extra vsyncs, two bytes, re-asserted every frame (the game rewrites them)
+            uint64_t a = obj + L->field; uint16_t cur, want = target == 60 ? 0x0000 : target == 30 ? 0x0101 : 0xffff;
+            if (want == 0xffff || !rd(a, &cur, sizeof cur) || cur == want) continue;
+            if (!have_orig[r][0]) { orig[r][0] = cur; have_orig[r][0] = 1; }
+            uint16_t *p = (uint16_t *)(uintptr_t)a; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+            if (nlog[r] < 8) { nlog[r]++; LOG("main: %s least %u most %u → least %u most %u (%d fps; %s)", L->what, cur & 0xff, cur >> 8, want & 0xff, want >> 8, target, src); }
+            continue;
+        }
+        for (int c = 0; c < L->copies; c++) {
+            uint64_t a = obj + L->field + 4 * (uint64_t)c; uint32_t cur, want; char was[16];
+            if (!rd(a, &cur, sizeof cur)) break;
+            if (L->kind == FPS_F32 || L->kind == MS_F32) {
+                int ms = L->kind == MS_F32; float f, w = ms ? ms_want(target) : (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
+                if (cur == want || !(ms ? f >= 8 && f <= 100 : f >= 10 && f <= 120)) continue;   // already set, or not set yet (RE Engine: 6000 at boot; Unreal: 0 = no limit until the config sets it)
+                snprintf(was, sizeof was, ms ? "%.3f ms" : "%g", f);
+            } else if (L->kind == SECS_F32) {
+                float f, w = 1.0f / (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
+                if (cur == want || !(f >= 1.0f / 120 && f <= 0.1f)) continue;   // not set yet (0 before the game's first frame)
+                snprintf(was, sizeof was, "%.5f s", f);
+            } else if (L->kind == TICKS_U32) {
+                want = L->scale / (uint32_t)target;
+                if (cur == want || cur < L->scale / 120 || cur > L->scale / 10) continue;
+                snprintf(was, sizeof was, "%u", cur);
+            } else if (L->kind == MODE_U32) {
+                want = 1;
+                if (cur) continue;   // already 1, or not this switch: 0 is the engine's default
+                snprintf(was, sizeof was, "%u", cur);
+            } else {
+                int fps = L->kind == FPS_I32;
+                want = fps ? (uint32_t)target : 60 / (uint32_t)target;
+                uint32_t value = !cur && L->kind == VSYNCS_DEFAULT2_I32 ? 2 : cur;   // Monolith's zero means its native two-vsync default
+                if (value == want || value < (fps ? 10u : 1u) || value > (fps ? 120u : 4u)) continue;
+                if (L->kind == MIN_VSYNCS_I32) {   // never above the controller's own maximum (row_holds)
+                    int mx = floor_max(L); if (!mx) continue;   // not set yet
+                    if (want > (uint32_t)mx) { if (!over[r]) { over[r] = 1; LOG("main: %s left at %u: %d fps needs %u vsyncs, above the controller's maximum %d (%s)", L->what, cur, target, want, mx, src); } continue; }
+                }
+                snprintf(was, sizeof was, "%u", cur);
+            }
+            if (c < 2 && !have_orig[r][c]) { orig[r][c] = cur; have_orig[r][c] = 1; }
+            uint32_t *p = (uint32_t *)(uintptr_t)a;
+            dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+            if (nlog[r] < 8) { nlog[r]++; char now[24];
+                if (L->kind == MS_F32) snprintf(now, sizeof now, "%.3f ms (%d fps)", ms_want(target), target);
+                else if (L->kind == SECS_F32) snprintf(now, sizeof now, "%.5f s (%d fps)", 1.0 / target, target);
+                else if (L->kind == TICKS_U32) snprintf(now, sizeof now, "%u (%d fps)", want, target);
+                else if (L->kind == MODE_U32) snprintf(now, sizeof now, "1 (%d fps)", target);
+                else snprintf(now, sizeof now, "%u%s", L->kind == FPS_F32 ? (unsigned)target : want, L->kind == FPS_F32 || L->kind == FPS_I32 ? " fps" : " vsyncs");
+                LOG("main: %s%s %s → %s (%s)", L->what, L->copies > 1 ? (c ? " (render thread)" : " (game thread)") : "", was, now, src); }
+        }
+    }
+}
+
+// The Mac's DM_CTL "cvarf <main offset> <value>" (hle_hid.c), for trying an Unreal console variable while the game runs: the TAutoConsoleVariable at main+offset holds at +0x10
+// the pointer to its value, the game thread's copy then the render thread's; both are set to the float
+void dm_ctl_cvar_f32(uint64_t off, float v) {
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
+        uint64_t obj; if (!rd((uint64_t)(uintptr_t)(g_mod[i].base + off + 0x10), &obj, sizeof obj) || !obj) { LOG("DM_CTL: cvarf main+%#llx: no value pointer yet", (unsigned long long)off); return; }
+        for (int c = 0; c < 2; c++) { float *p = (float *)(uintptr_t)(obj + 4 * (uint64_t)c); dm_guest_write_prepare(p, sizeof *p); *p = v; }
+        LOG("DM_CTL: cvarf main+%#llx = %g (both copies at %#llx)", (unsigned long long)off, v, (unsigned long long)obj);
+    }
+}
+// "peek <guest address> <count>": count floats (and their bits) from guest memory, read safely, to the log
+void dm_ctl_peek(uint64_t a, int n) {
+    for (int i = 0; i < n && i < 64; i += 4) {
+        uint32_t w[4] = {0}; int k = n - i < 4 ? n - i : 4;
+        if (!rd(a + 4 * (uint64_t)i, w, 4 * (size_t)k)) { LOG("DM_CTL: peek %#llx: not readable", (unsigned long long)(a + 4 * (uint64_t)i)); return; }
+        float f[4]; memcpy(f, w, sizeof f);
+        LOG("DM_CTL: peek %#llx: %g %g %g %g (%08x %08x %08x %08x)", (unsigned long long)(a + 4 * (uint64_t)i), f[0], f[1], f[2], f[3], w[0], w[1], w[2], w[3]);
+    }
+}
+// "memdump <guest address> <bytes> <path>": guest memory to a file, read safely (stops at the first unreadable page)
+void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) {
+    FILE *f = fopen(path, "wb"); if (!f) { LOG("[RED] DM_CTL: memdump: cannot open %s", path); return; }
+    static uint8_t buf[1 << 16]; uint64_t done = 0;
+    while (done < n) { size_t k = n - done < sizeof buf ? (size_t)(n - done) : sizeof buf; if (!rd(a + done, buf, k)) break; fwrite(buf, 1, k, f); done += k; }
+    fclose(f); LOG("DM_CTL: memdump %#llx: %llu of %llu bytes → %s", (unsigned long long)a, (unsigned long long)done, (unsigned long long)n, path);
+}
+// "cvari <main offset> <value>": the same for an int console variable
+void dm_ctl_cvar_i32(uint64_t off, int32_t v) {
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
+        uint64_t obj; if (!rd((uint64_t)(uintptr_t)(g_mod[i].base + off + 0x10), &obj, sizeof obj) || !obj) { LOG("DM_CTL: cvari main+%#llx: no value pointer yet", (unsigned long long)off); return; }
+        for (int c = 0; c < 2; c++) { int32_t *p = (int32_t *)(uintptr_t)(obj + 4 * (uint64_t)c); dm_guest_write_prepare(p, sizeof *p); *p = v; }
+        LOG("DM_CTL: cvari main+%#llx = %d (both copies at %#llx)", (unsigned long long)off, v, (unsigned long long)obj);
+    }
+}

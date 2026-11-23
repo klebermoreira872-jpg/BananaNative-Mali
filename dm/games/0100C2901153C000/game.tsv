@@ -1,0 +1,43 @@
+# Provisional game profile of Yoru, Tomosu (Switch, Japanese release, base game v0), SDK 9.5.0, NVN through nn::gfx. Written by Peanuts Native from a survey of the game files with
+# dm/games/profile_guess.py; the game has not been booted with it. Every key marked "guess" follows a rule or a sibling profile and is not measured. README.md beside this file.
+# Format: see dm/games/README.md
+
+# ---- Identity ----
+title_id	0100C2901153C000
+program_id	0100C2901153C000
+
+# ---- App ----
+name	Yoru, Tomosu
+ipa	YoruTomosu.ipa
+app_category	public.app-category.adventure-games
+# no pad_layout: a text adventure, the default 2D layout (guess: nothing in the files decides it)
+
+# ---- Versions ----
+# The display version was not read (the import keeps no control data)
+build	v0	?	main=3a573656d869f5786166fcff376c93ae	sdk=f93ce78898c2583ae08d87d3f2c2e4d6
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# load order as on Horizon: main, sdk (the game has no subsdk). main also imports eight glslc* functions that no module of the game defines (there is no GLSLC module): with nn::gfx
+# these come with the library, as in Resident Evil 4
+modules	main sdk
+romfs_marker	font/font.bntx
+# the file types that are big or already compressed (profile_guess.py's rule; .bfstm is the streamed sound, 0.9 GB)
+zip_store	.bntx:.bfstm:.bfsar:.metallib
+
+# ---- Memory ----
+# guess (profile_guess.py's rule, not measured): the NPDM declares no system resource (META +0x14 = 0), so there is no virtual address memory, and main never imports
+# nn::os::SetMemoryHeapSize: its memory is its own bss (1,569 MB, part of the module image and counted as used memory, not part of the block below), which it hands to
+# nn::mem::StandardAllocator and nn::lmem exp heaps. So the 1 GB block of a game without a heap (256 MB in front + 256 MB alias region + 256 MB stack region + 256 MB heap region),
+# with the hardware pool
+mem_reserve	0x40000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+sys_resource	0x0
+# no mem_used: the rewritten modules without the bss are under the default 64 MB; whether anything asks for the used memory size is not known
+
+# ---- Shader split (shader_split.py: 24 BNSH files in the RomFS folder shader/, none in main) ----
+shader_groups	/=romfs
+shader_note	Yoru, Tomosu shaders (provisional profile)

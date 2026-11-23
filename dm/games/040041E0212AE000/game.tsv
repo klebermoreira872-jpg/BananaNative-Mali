@@ -1,0 +1,50 @@
+# Fast Fusion, SDK 20.5.13 (Ounce), NVN2.
+# The standard host and rewriter run this build; SHN! resources are read by the shared shader splitter.
+
+# ---- Identity ----
+title_id	040041E0212AE000
+program_id	040041E0212AE000
+
+# ---- App ----
+name	Fast Fusion
+ipa	FastFusion.ipa
+app_category	public.app-category.racing-games
+
+# ---- Versions ----
+build	v262144	v262144	main=e76e60ef4fe21decb40223b5de5e6396	sdk=bbaa095d525b16296c21f45ea0ae560b
+package	v262144
+shader_versions	v262144
+
+# ---- Files ----
+# not loaded, main takes nothing from them the host does not supply: subsdk0 (C / libc), subsdk1 (C / libc)
+modules	main sdk
+romfs_marker	terrain/10_materials/00_snow_normal.bc7u.tex
+zip_store	.otf:.tex:.vma:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 9216 MB heap region
+mem_reserve	0x270000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+# the sdk is built for the Switch 2 (spec: Ounce): its 9 GB pool
+app_pool	0x240000000
+# the NPDM declares no system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon
+sys_resource	0x0
+
+# ---- Graphics ----
+# The scripts size the framebuffer by the operation mode (hires 0: console 1920x1080, handheld 1280x720; main+0x10f328 -> 0x11ff04 / 0x11ff1c, built at 0x1218cc),
+# and the window crop is the smallest of vi's BufferMaxResolution cap, oe::GetDefaultDisplayResolution and the window (main+0x11fde4). The graphics scale is only a script
+# property (graphicsScale, main+0x10f0d0). Both modes present 1920x1080 (on Switch 2 oe answers the 1080p screen in handheld too); they differ in the DLSS input:
+# Docked is the game's own start (races: DLSS 960x540 -> 1920x1080), Handheld its handheld mode (races: DLSS 640x360 -> 1920x1080; Odin 3: GPU about 13.8 vs 14.0 ms).
+# A row's size is the launcher's choice (one row per size), not what this game draws: 1280x720 names the handheld choice
+graphics_scale	1920x1080	1	console
+graphics_scale	1280x720	0	handheld
+# Android: the game's DLSS (NVN2) runs on vka's stand-in, Snapdragon GSR2 3-pass (vka_dlss.c); the launcher's Upscaler row offers its modes (GSR 2, FSR 1, FSR 3.1,
+# Bilinear) with Motion clarity (DM_VK_GSR2_CLARITY) and Temporal sharpness (DM_VK_DLSS_SHARP), in Game settings and the in-game panel. The stand-in keeps the colour's
+# alpha, which this game composites its 3D layer over the menu UI by
+dlss_standin	1
+
+# ---- Shader split ----
+depth_mode	zero
+shader_groups	/objects/=objects /sets2/=sets2 /audio/=audio /particles/=particles /sets3/=sets3 /shaders/=shaders /menu/=menu /tracks/=tracks /sets/=sets /fonts/=fonts /bulletcache/=bulletcache /lightprobes/=lightprobes /terrain/=terrain /vibration/=vibration /materials/=materials /localize/=localize /ndsr/=ndsr /prefabs/=prefabs /scripts/=scripts /shadertextures/=shadertextures
+shader_note	Fast Fusion shaders

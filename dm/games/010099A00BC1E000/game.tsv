@@ -1,0 +1,42 @@
+# Provisional game profile of Resident Evil 4 (Switch, base game v0 + update v131072), SDK 5.4.0, NVN through nn::gfx. Written from a survey of the game files with
+# dm/games/profile_guess.py (Peanuts Native's); only that project has booted the game with it. Every key marked "guess" follows a rule or a sibling profile and is not measured. README.md beside this file.
+# Format: see dm/games/README.md
+
+# ---- Identity ----
+title_id	010099A00BC1E000
+program_id	010099A00BC1E000
+
+# ---- App ----
+name	Resident Evil 4
+ipa	ResidentEvil4.ipa
+app_category	public.app-category.action-games
+# guess: a third-person game that uses both sticks and the D-pad; nothing in the files decides it
+pad_layout	full
+
+# ---- Versions ----
+# The update changes only main (the base game's is 8ceaf0d2ae48a9350c60d38a43119325); subsdk0 and sdk are the base game's files. The display version was not read (the import keeps no control data)
+build	v131072	?	main=82c2a04a21d3e0b850f273d4149c9003	subsdk0=2e8d3a967b3539eb77f50d1647380378	sdk=f7c7b7a90ecdc2d41c97508cc7236b8a
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+# load order as on Horizon: main, subsdk0, sdk. subsdk0 is NintendoSDK_movie: main takes 29 functions from it (movie::Decoder, H.264, for the CRI movies), none of which the host supplies itself.
+# main also imports eight glslc* functions that no module of the game defines (there is no GLSLC module); whether it ever calls them is not known
+modules	main subsdk0 sdk
+romfs_marker	bio4/snd/bio4bgm.awb
+# the file types that are big or already compressed (profile_guess.py's rule)
+zip_store	.awb:.fen:.fix:.udas:.usm:.metallib
+
+# ---- Memory ----
+# guess (profile_guess.py's rule, not measured): the NPDM declares no system resource (META +0x14 = 0), so there is no virtual address memory, and main imports nn::os::SetMemoryHeapSize:
+# the 4 GB layout of such games (256 MB in front + 256 MB alias region + 256 MB stack region + 3.25 GB heap region), with the hardware pool
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+sys_resource	0x0
+# no mem_used: the rewritten modules are 49 MB (main 28.9, sdk 12.5, subsdk0 7.4), under the default 64 MB of used memory
+
+# ---- Shader split (shader_split.py: 207 BNSH files embedded in main, none in the RomFS) ----
+shader_groups	/=romfs
+shader_note	Resident Evil 4 shaders (provisional profile)

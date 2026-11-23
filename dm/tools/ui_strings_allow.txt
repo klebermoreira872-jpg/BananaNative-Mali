@@ -1,0 +1,283 @@
+# Literals the guard (dm/tools/ui_strings.py --check, dm/tools/tests/test_ui_strings.py) lets stay in the code. One line each: <file>\t<literal as in the source>.
+# A new user-visible string goes into res/values/strings.xml and is read with Tx.s(R.string.key), or with Words.s("key", "English") in the classes that run without Android
+# (android/README.md, Languages), not into this list.
+
+# Stays English on purpose: the Advanced page (switch names and its own words), the game's own language names (GameLanguage), the Switch button names (PadMap), the bug-report digest (LogDigest), shader-library parsing, Prepare's job log (PackService), the GitHub driver sources and their errors (DriverFetch), the debug-only sample release page and graphics self-test, regexes and keys
+main/java/dev/nxnative/android/AdvancedPage.java	 goes back to Auto.
+main/java/dev/nxnative/android/AdvancedPage.java	Every row you set for 
+main/java/dev/nxnative/android/AdvancedPage.java	Every row you set under Advanced goes back to Auto, for every game.
+main/java/dev/nxnative/android/AdvancedPage.java	Reset all
+main/java/dev/nxnative/android/AdvancedPage.java	Advanced
+main/java/dev/nxnative/android/AdvancedPage.java	Every switch starts at Auto: nothing is written and the app decides. A change applies at the next start; a line in env.txt or Extra environment wins.
+main/java/dev/nxnative/android/AdvancedPage.java	 only; these win over Settings > Advanced. Auto writes nothing. A change applies at the next start.
+main/java/dev/nxnative/android/AdvancedPage.java	For 
+main/java/dev/nxnative/android/AdvancedPage.java	Search a name, a symptom or DM_...
+main/java/dev/nxnative/android/AdvancedPage.java	Experimental  
+main/java/dev/nxnative/android/AdvancedPage.java	Developer  
+main/java/dev/nxnative/android/AdvancedPage.java	. Turn on Developer to search every switch.
+main/java/dev/nxnative/android/AdvancedPage.java	Nothing matches
+main/java/dev/nxnative/android/AdvancedPage.java	. Experimental shows the rest.
+main/java/dev/nxnative/android/AdvancedPage.java	Nothing to set here
+main/java/dev/nxnative/android/AdvancedPage.java	Search finds more switches.
+main/java/dev/nxnative/android/AdvancedPage.java	Auto
+main/java/dev/nxnative/android/AdvancedPage.java	Experimental
+main/java/dev/nxnative/android/AdvancedPage.java	Try this if 
+main/java/dev/nxnative/android/AdvancedPage.java	. Settings: 
+main/java/dev/nxnative/android/AdvancedPage.java	Auto: 
+main/java/dev/nxnative/android/AdvancedPage.java	Set in 
+main/java/dev/nxnative/android/AdvancedPage.java	This one has its own control: 
+main/java/dev/nxnative/android/AdvancedPage.java	Changed
+main/java/dev/nxnative/android/AdvancedPage.java	Save
+main/java/dev/nxnative/android/AdvancedPage.java	Not a value this row takes
+main/java/dev/nxnative/android/AdvancedPage.java	Cancel
+main/java/dev/nxnative/android/AdvancedTable.java	Audio
+main/java/dev/nxnative/android/AdvancedTable.java	Diagnostics
+main/java/dev/nxnative/android/AdvancedTable.java	Game
+main/java/dev/nxnative/android/AdvancedTable.java	Graphics
+main/java/dev/nxnative/android/AdvancedTable.java	Input
+main/java/dev/nxnative/android/AdvancedTable.java	Memory
+main/java/dev/nxnative/android/AdvancedTable.java	Packing
+main/java/dev/nxnative/android/AdvancedTable.java	Performance
+main/java/dev/nxnative/android/DriverFetch.java	Mr. Purple Turnip
+main/java/dev/nxnative/android/DriverFetch.java	whitebelyash Turnip CI
+main/java/dev/nxnative/android/DriverFetch.java	Weab-chan Freedreno CI
+main/java/dev/nxnative/android/DriverFetch.java	GameHub Adreno 8xx
+main/java/dev/nxnative/android/DriverFetch.java	StevenMXZ Qualcomm 891.14 (recommended) and Turnip
+main/java/dev/nxnative/android/DriverFetch.java	GitHub rate limit, try again later
+main/java/dev/nxnative/android/DriverFetch.java	GitHub answered HTTP 
+main/java/dev/nxnative/android/DriverFetch.java	No network (cannot reach GitHub)
+main/java/dev/nxnative/android/DriverFetch.java	No network (GitHub did not answer in time)
+main/java/dev/nxnative/android/DriverFetch.java	GitHub's answer could not be read: 
+main/java/dev/nxnative/android/DriverFetch.java	the zip is larger than 512 MB: not a driver package
+main/java/dev/nxnative/android/DriverFetch.java	the download is larger than 512 MB: not a driver package
+main/java/dev/nxnative/android/DriverFetch.java	Reading the releases of 
+main/java/dev/nxnative/android/GameLanguage.java	zh-Hans
+main/java/dev/nxnative/android/GameLanguage.java	zh-Hant
+main/java/dev/nxnative/android/GameLanguage.java	English (UK)
+main/java/dev/nxnative/android/GameLanguage.java	English (US)
+main/java/dev/nxnative/android/GameLanguage.java	French
+main/java/dev/nxnative/android/GameLanguage.java	French (Canada)
+main/java/dev/nxnative/android/GameLanguage.java	German
+main/java/dev/nxnative/android/GameLanguage.java	Italian
+main/java/dev/nxnative/android/GameLanguage.java	Japanese
+main/java/dev/nxnative/android/GameLanguage.java	Spanish (Latin America)
+main/java/dev/nxnative/android/GameLanguage.java	Spanish (Spain)
+main/java/dev/nxnative/android/GameLanguage.java	Chinese (Simplified)
+main/java/dev/nxnative/android/GameLanguage.java	Chinese (Traditional)
+main/java/dev/nxnative/android/GameLanguage.java	Dutch
+main/java/dev/nxnative/android/GameLanguage.java	Korean
+main/java/dev/nxnative/android/GameLanguage.java	Polish
+main/java/dev/nxnative/android/GameLanguage.java	Portuguese
+main/java/dev/nxnative/android/GameLanguage.java	Portuguese (Brazil)
+main/java/dev/nxnative/android/GameLanguage.java	Russian
+main/java/dev/nxnative/android/GameLanguage.java	Thai
+main/java/dev/nxnative/android/GpuDriver.java	libraryName
+main/java/dev/nxnative/android/LogDigest.java	<apk>/
+main/java/dev/nxnative/android/LogDigest.java	<app cache>
+main/java/dev/nxnative/android/LogDigest.java	<app files>
+main/java/dev/nxnative/android/LogDigest.java	<app internal>
+main/java/dev/nxnative/android/LogDigest.java	<sd card>/
+main/java/dev/nxnative/android/LogDigest.java	<sdcard>/
+main/java/dev/nxnative/android/LogDigest.java	<path>
+main/java/dev/nxnative/android/PadMap.java	D-pad down
+main/java/dev/nxnative/android/PadMap.java	D-pad left
+main/java/dev/nxnative/android/PadMap.java	D-pad right
+main/java/dev/nxnative/android/PadMap.java	D-pad up
+main/java/dev/nxnative/android/PadMap.java	L stick click
+main/java/dev/nxnative/android/PadMap.java	R stick click
+main/java/dev/nxnative/android/ReleasePage.java	## What's new in the sample\n\nA page for the notes, with **bold**, *italic*, `code` and a [link](https://example.org/).\n\n
+main/java/dev/nxnative/android/ReleasePage.java	### Highlights\n\n- A full page in place of the small dialog\n- Pictures from the notes, below their text\n  - loaded on their own, never blocking Update\n
+main/java/dev/nxnative/android/ReleasePage.java	- A bar with Later and Update that stays in reach\n\n![The first picture](https://raw.githubusercontent.com/github/explore/main/topics/android/android.png)\n\n
+main/java/dev/nxnative/android/ReleasePage.java	1. A numbered item\n2) Another one that is long enough to wrap onto a second line so that the page shows how a wrapped item looks under its number\n\n
+main/java/dev/nxnative/android/ReleasePage.java	<img src=\"https://raw.githubusercontent.com/github/explore/main/topics/java/java.png\" alt=\"The second picture (HTML)\">\n\n
+main/java/dev/nxnative/android/ReleasePage.java	![A picture that is not there](https://raw.githubusercontent.com/github/explore/main/does-not-exist.png)\n\n
+main/java/dev/nxnative/android/ReleasePage.java	![Refused host](https://example.org/x.png)\n\nThe end of the sample.
+main/java/dev/nxnative/android/SelftestActivity.java	FAIL: cannot open the log 
+main/java/dev/nxnative/android/ShaderLibs.java	(?s).*\"accepted\"\\s*:\\s*true.*
+main/java/dev/nxnative/android/TextInput.java	: the maximum is used as the minimum
+ondevice/java/dev/nxnative/android/PackService.java	an intent without \"from\"
+ondevice/java/dev/nxnative/android/PackService.java	going on anyway: the heat pause is lifted (from 
+ondevice/java/dev/nxnative/android/PackService.java	going on after Android ended the job's process (a sticky restart; 
+ondevice/java/dev/nxnative/android/PackService.java	pausing: timeout: Android's daily limit for background work (6 h of dataSync) is reached; 
+ondevice/java/dev/nxnative/android/PackService.java	pausing: refused: Android did not let the job start in the background (
+ondevice/java/dev/nxnative/android/PackService.java	pause asked (from 
+ondevice/java/dev/nxnative/android/PackService.java	 pause: ending the process (the step runs again on Resume)
+ondevice/java/dev/nxnative/android/PackService.java	the tool did not stop within 20 s of the 
+ondevice/java/dev/nxnative/android/PackService.java	 % and not charging
+ondevice/java/dev/nxnative/android/PackService.java	going on after the 
+ondevice/java/dev/nxnative/android/PackService.java	the job's shaders are from another app version: translating them again
+ondevice/java/dev/nxnative/android/PackService.java	before it goes on
+ondevice/java/dev/nxnative/android/PackService.java	 times before it finished (most likely for memory); 
+ondevice/java/dev/nxnative/android/PackService.java	stopping: the step was ended by Android 
+ondevice/java/dev/nxnative/android/PackService.java	a shader build of a game being played runs in this process: it is asked to stop after the shader in hand, and the job waits for it
+ondevice/java/dev/nxnative/android/PackService.java	the shader build ended: the job goes on
+ondevice/java/dev/nxnative/android/PackService.java	shader_map.tsv without 
+ondevice/java/dev/nxnative/android/PackService.java	 shaders of other versions of the game
+ondevice/java/dev/nxnative/android/PackService.java	 names none of the shaders of its shader_map.tsv
+ondevice/java/dev/nxnative/android/PackService.java	before the pack step
+ondevice/java/dev/nxnative/android/PackService.java	 step's outputs are gone right after it finished (pack folder 
+ondevice/java/dev/nxnative/android/PackService.java	 went missing while it prepared the game. Tap Retry.
+ondevice/java/dev/nxnative/android/PackService.java	The app's files for 
+ondevice/java/dev/nxnative/android/PackService.java	app 
+ondevice/java/dev/nxnative/android/PackService.java	 stopped with code 
+ondevice/java/dev/nxnative/android/PackService.java	 recorded done, but 
+ondevice/java/dev/nxnative/android/PackService.java	 (patched.bin and its key)
+ondevice/java/dev/nxnative/android/PackService.java	 again (finished shader results are kept)
+ondevice/java/dev/nxnative/android/PackService.java	cannot compare the dump's shaders with the app's list: 
+ondevice/java/dev/nxnative/android/PackService.java	. Tap Retry. If it stops again, Details has the error.
+ondevice/java/dev/nxnative/android/PackService.java	The app could not compare your dump's shaders with its list for 
+ondevice/java/dev/nxnative/android/PackService.java	The phone ran out of memory while finding the shaders. Close other apps, then tap Retry.
+ondevice/java/dev/nxnative/android/PackService.java	the phone ran out of memory while finding the shaders in 
+ondevice/java/dev/nxnative/android/PackService.java	 of your dump. The file may be damaged: 
+ondevice/java/dev/nxnative/android/PackService.java	The app could not read 
+ondevice/java/dev/nxnative/android/PackService.java	dump the game again, then tap Retry.
+ondevice/java/dev/nxnative/android/PackService.java	 of the dump (
+ondevice/java/dev/nxnative/android/PackService.java	the split could not read 
+ondevice/java/dev/nxnative/android/PackService.java	), so its shaders are not the ones this app knows for 
+ondevice/java/dev/nxnative/android/PackService.java	. The file may be damaged: dump the game again, then Retry
+ondevice/java/dev/nxnative/android/PackService.java	 differs from the app's dm/games/
+ondevice/java/dev/nxnative/android/PackService.java	the dump's shaders are not the ones this app knows for 
+ondevice/java/dev/nxnative/android/PackService.java	 differs). The dump may be incomplete or modified: dump the game again, then Retry
+
+# English source arrays of pickers: the UI shows the R.array.arr_* resources (Tx.arr); the constants stay for the tests, logs and the stored index order
+main/java/dev/nxnative/android/DlssTune.java	Nearest neighbor
+main/java/dev/nxnative/android/DlssTune.java	Bilinear
+main/java/dev/nxnative/android/DlssTune.java	Bicubic
+main/java/dev/nxnative/android/DlssTune.java	FSR 1
+main/java/dev/nxnative/android/DlssTune.java	SGSR 1
+main/java/dev/nxnative/android/DlssTune.java	Device (power saving)
+main/java/dev/nxnative/android/DlssTune.java	Balanced
+main/java/dev/nxnative/android/DlssTune.java	Clear
+main/java/dev/nxnative/android/DlssTune.java	Clearest
+main/java/dev/nxnative/android/DlssTune.java	Steadiest
+main/java/dev/nxnative/android/DlssTune.java	Steady
+main/java/dev/nxnative/android/DlssTune.java	 (may flicker in combat)
+main/java/dev/nxnative/android/DlssTune.java	Bilinear (fastest, softest)
+main/java/dev/nxnative/android/DlssTune.java	FSR 1 (sharp, fast)
+main/java/dev/nxnative/android/DlssTune.java	FSR 3.1 (sharp, steady)
+main/java/dev/nxnative/android/DlssTune.java	GSR 2 (smooth images)
+main/java/dev/nxnative/android/GameUpscaler.java	Bilinear (fastest, softest)
+main/java/dev/nxnative/android/GameUpscaler.java	FSR 1 (sharp, fast; too bright on Qualcomm's driver in some games)
+main/java/dev/nxnative/android/GameUpscaler.java	Native (sharpest, slowest)
+main/java/dev/nxnative/android/GameUpscaler.java	Nearest neighbor (fastest, blocky)
+main/java/dev/nxnative/android/GameUpscaler.java	SGSR 1 (sharp, fast, one pass)
+main/java/dev/nxnative/android/GameUpscaler.java	Default
+main/java/dev/nxnative/android/GameUpscaler.java	Max
+main/java/dev/nxnative/android/GameUpscaler.java	Off
+main/java/dev/nxnative/android/GameUpscaler.java	Soft
+main/java/dev/nxnative/android/GameUpscaler.java	Softer
+main/java/dev/nxnative/android/GameUpscaler.java	); it applies at the next start
+main/java/dev/nxnative/android/PadPanel.java	Hold − and + only (half a second)
+main/java/dev/nxnative/android/PadPanel.java	Home button only
+main/java/dev/nxnative/android/PadPanel.java	Home, or hold − and + (half a second)
+main/java/dev/nxnative/android/PadPanel.java	Off
+main/java/dev/nxnative/android/PanelLook.java	Large
+main/java/dev/nxnative/android/PanelLook.java	Normal
+main/java/dev/nxnative/android/PanelLook.java	Small
+main/java/dev/nxnative/android/Prefs.java	Off
+main/java/dev/nxnative/android/Prefs.java	Swap labels for X/Y and A/B
+main/java/dev/nxnative/android/Prefs.java	Swap labels for X/Y, swap buttons A/B
+main/java/dev/nxnative/android/Prefs.java	Automatic
+main/java/dev/nxnative/android/Prefs.java	Landscape
+main/java/dev/nxnative/android/Prefs.java	Fit (keep aspect)
+main/java/dev/nxnative/android/Prefs.java	Stretch to screen
+main/java/dev/nxnative/android/Prefs.java	Dark
+main/java/dev/nxnative/android/Prefs.java	Follow the system
+main/java/dev/nxnative/android/Prefs.java	Light
+main/java/dev/nxnative/android/Prefs.java	Bananas
+main/java/dev/nxnative/android/Prefs.java	My picture
+main/java/dev/nxnative/android/Prefs.java	Plain
+main/java/dev/nxnative/android/TouchControls.java	ZL L −
+main/java/dev/nxnative/android/TouchControls.java	ZR R +
+main/java/dev/nxnative/android/TouchControls.java	left stick
+main/java/dev/nxnative/android/TouchControls.java	right stick
+main/java/dev/nxnative/android/TouchControls.java	Bottom
+main/java/dev/nxnative/android/TouchControls.java	Centre
+main/java/dev/nxnative/android/TouchControls.java	Done
+main/java/dev/nxnative/android/TouchControls.java	Reset
+main/java/dev/nxnative/android/TouchControls.java	Top
+main/java/dev/nxnative/android/TouchControls.java	: a gamepad is connected
+main/java/dev/nxnative/android/TouchControls.java	Auto
+main/java/dev/nxnative/android/TouchControls.java	Off
+main/java/dev/nxnative/android/TouchControls.java	On
+main/java/dev/nxnative/android/TouchControls.java	 by the user
+main/java/dev/nxnative/android/TouchControls.java	, the user's layout
+main/java/dev/nxnative/android/TouchControls.java	 (the automatic one)
+
+# Host and launcher log lines, test-app notes, diagnostic labels before a path or a build ID ("Pack: ", "Save: ") shown under a dialog's Details, and the HUD's own short words
+main/java/dev/nxnative/android/Folders.java	 is gone; using 
+main/java/dev/nxnative/android/GameActivity.java	a save restore or swap that was stopped was finished first
+main/java/dev/nxnative/android/GameActivity.java	.txt (test app)
+main/java/dev/nxnative/android/GameActivity.java	), using the app's private folder
+main/java/dev/nxnative/android/GameActivity.java	, checked); that folder is kept as it was
+main/java/dev/nxnative/android/GameActivity.java	copied once from 
+main/java/dev/nxnative/android/GameActivity.java	): this start plays the save in 
+main/java/dev/nxnative/android/GameActivity.java	; the next start tries again
+main/java/dev/nxnative/android/GameActivity.java	not copied into the app's storage (
+main/java/dev/nxnative/android/GameActivity.java	the game's settings
+main/java/dev/nxnative/android/GameActivity.java	: 16:9 or wider, as shipped
+main/java/dev/nxnative/android/GameActivity.java	: about 16:9, nothing passed
+main/java/dev/nxnative/android/GameActivity.java	unchecked=the GPU check did not answer in 
+main/java/dev/nxnative/android/GameActivity.java	 (start-up check)
+main/java/dev/nxnative/android/GameActivity.java	 GiB as Android reports it.
+main/java/dev/nxnative/android/GameActivity.java	 in the pack (Prepare again brings the game's own) and none imported
+main/java/dev/nxnative/android/GameActivity.java	 (imported only: the pack has no profile cheat file)
+main/java/dev/nxnative/android/GameActivity.java	 cheats for build 
+main/java/dev/nxnative/android/GameActivity.java	); this start runs without cheats
+main/java/dev/nxnative/android/GameActivity.java	no RomFS in 
+main/java/dev/nxnative/android/GameActivity.java	 requests the shader library already has are dropped
+main/java/dev/nxnative/android/GameActivity.java	): the host uses the phone's own fonts
+main/java/dev/nxnative/android/GameActivity.java	): button icons in game text draw as '?'
+main/java/dev/nxnative/android/GameActivity.java	 (nothing chosen: the earlier settings' match or the default)
+main/java/dev/nxnative/android/GameActivity.java	the game's own palette
+main/java/dev/nxnative/android/GameActivity.java	 environment lines (all but the paths), set before the GPU driver's first device
+main/java/dev/nxnative/android/GameActivity.java	[RED] 
+main/java/dev/nxnative/android/GameActivity.java	); it applies at the next start
+main/java/dev/nxnative/android/GameActivity.java	 % (the in-game panel)
+main/java/dev/nxnative/android/GameActivity.java	 (the in-game panel): 
+main/java/dev/nxnative/android/GameActivity.java	 exists but cannot be read (
+main/java/dev/nxnative/android/GameActivity.java	): no switches from it this run; after writing it with adb, chmod 666 it
+main/java/dev/nxnative/android/GameSettings.java	DM_WATCH_STALL=25
+main/java/dev/nxnative/android/MainActivity.java	 ignored: ADB control is off (Settings › Help › ADB control)
+main/java/dev/nxnative/android/MainActivity.java	Donkey Kong Bananza
+main/java/dev/nxnative/android/MainActivity.java	Mario Kart World
+main/java/dev/nxnative/android/MainActivity.java	Zelda: Ocarina of Time
+main/java/dev/nxnative/android/MainActivity.java	Mario Tennis Fever
+main/java/dev/nxnative/android/MainActivity.java	Not in this app version
+main/java/dev/nxnative/android/MainActivity.java	Ready \u00b7 updating shaders
+main/java/dev/nxnative/android/MainActivity.java	Ready \u00b7 checking shaders
+main/java/dev/nxnative/android/MainActivity.java	 did not finish.
+main/java/dev/nxnative/android/MainActivity.java	.android.key is missing: the rewrite of 
+main/java/dev/nxnative/android/MainActivity.java	 taken over as v-
+main/java/dev/nxnative/android/MainActivity.java	: same build IDs, same code
+main/java/dev/nxnative/android/MainActivity.java	 (shaders on demand)
+main/java/dev/nxnative/android/MainActivity.java	no usable pack
+main/java/dev/nxnative/android/MainActivity.java	 other dump(s) of it on the list
+main/java/dev/nxnative/android/MainActivity.java	 by its build IDs
+main/java/dev/nxnative/android/MainActivity.java	Game: 
+main/java/dev/nxnative/android/MainActivity.java	\nPack: 
+main/java/dev/nxnative/android/MainActivity.java	Pack: 
+main/java/dev/nxnative/android/PackUi.java	Pack folder: 
+main/java/dev/nxnative/android/PackUi.java	Into: 
+main/java/dev/nxnative/android/PrepareText.java	translator does not match the lock file: 
+main/java/dev/nxnative/android/SaveUi.java	\nSave: 
+main/java/dev/nxnative/android/SaveUi.java	\nZip: 
+main/java/dev/nxnative/android/SaveUi.java	Zip: 
+main/java/dev/nxnative/android/SidePanel.java	Controls
+main/java/dev/nxnative/android/SidePanel.java	Display
+main/java/dev/nxnative/android/SidePanel.java	General
+main/java/dev/nxnative/android/SidePanel.java	Performance
+main/java/dev/nxnative/android/SidePanel.java	); it applies at the next start
+main/java/dev/nxnative/android/SidePanel.java	: no plain cheat, see the cheats lines above
+main/java/dev/nxnative/android/SidePanel.java	: no such cheat
+main/java/dev/nxnative/android/SidePanel.java	: not in this host
+main/java/dev/nxnative/android/SidePanel.java	: the host did not take it (
+ondevice/java/dev/nxnative/android/Ondevice.java	Pack: 
+ondevice/java/dev/nxnative/android/Ondevice.java	\nLogs: 
+ondevice/java/dev/nxnative/android/Ondevice.java	\nPack: 
+ondevice/java/dev/nxnative/android/Ondevice.java	\nWorking files: 
+ondevice/java/dev/nxnative/android/Ondevice.java	\n\nDump: 
+main/java/dev/nxnative/android/PackUi.java	# the game and the profile inputs this library was built from (dm/gfx/tools/dmsh_chain.py inputs)\ngame\t
+ondevice/java/dev/nxnative/android/Ondevice.java	 moved in, no check
+ondevice/java/dev/nxnative/android/Ondevice.java	; the sampled check decides)
+main/java/dev/nxnative/android/SelftestActivity.java	DM_VK_DRIVER=

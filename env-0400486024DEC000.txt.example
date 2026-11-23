@@ -1,0 +1,11 @@
+# Per-game environment lines for Galaxy A16 (Mali-G57, Mesa PanVK). Copy to <app files>/env-0400486024DEC000.txt (one KEY=VALUE per line).
+# Most of these are now the defaults on PanVK in this build; they are listed so a log shows them as set.
+DM_VK_GPL=0
+DM_VK_MESH_EMU=1
+DM_VK_MESH_EMU_MB=128
+DM_VK_IMG_CAP_MB=512
+DM_VK_TEX_SOFT=1
+DM_VK_TEX_SOFT_LEVELS=2
+# optional: ask for the BGRA swapchain format first if the RGBA one shows nothing
+# DM_VK_SWAP_FORMAT=bgra
+# DM_PRESENT_SNAP is read by the Metal (Mac/iOS) host only; Android's Vulkan present ignores it, so it is not listed.

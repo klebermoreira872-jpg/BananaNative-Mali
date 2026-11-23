@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+# Game profiles: dm/games/<base game title ID>/game.tsv (key <TAB> values..., lines starting with # are comments) + the shader tables (and patches.py, the rewriter's patches of the game's builds) in the same folder. The shader tools, the host build, iOS packaging and the NSP script take each game's constants from here.
+# Usage: game.py list (list all profiles); game.py <id> <key> [<default>] (print that key's value, for shell; without a default a missing key is an error); game.py header <id> <out.h> (generate the host's game_profile.h);
+#   game.py seed <id> <out.h> (the Android host's vk_prewarm_seed.h: the profile's vk_prewarm.bin, the pipeline keys a first start makes ahead, as bytes; dm/gfx/vk_android/vka_pwlist.h);
+#   game.py dir <id> (print the profile folder); game.py link <id> <link> (point a symlink at the profile folder: make cannot take paths with spaces)
+#   From Python: import game; g = game.load() (takes DM_GAME; there is no default game: unset is an error that lists the profiles); game.by_title(title ID); g.get / g.words / g.int / g.builds() / g.table(file name)
+# DM_GAMES_DIR (folders separated by ':') adds profile folders outside the repository, searched after dm/games: the NSP script writes a provisional profile for a game without one into
+#   <NSP folder>/<id>_build/profile/<id>/ and points DM_GAMES_DIR at <id>_build/profile, so the shader tools, the host build and build_ipa.sh all find it.
+#   DM_GAMES_FIRST=1 searches DM_GAMES_DIR before dm/games (the NSP script's --provisional: a provisional profile for a game that has one in dm/games, to test the guesses)
+import os, re, sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+class Game:
+    def __init__(self, d):
+        self.dir = Path(d).resolve(); self.id = self.dir.name; self.rows = []
+        for line in (self.dir / 'game.tsv').read_text(encoding='utf-8').splitlines():
+            if not line.strip() or line.lstrip().startswith('#'): continue
+            c = line.split('\t'); self.rows.append((c[0].strip(), [v.strip() for v in c[1:]]))
+
+    def values(self, key):   # every row of this key (keys such as build repeat)
+        return [v for k, v in self.rows if k == key]
+
+    def get(self, key, default=None):
+        r = self.values(key)
+        if r: return '\t'.join(r[0])
+        if default is None: raise KeyError(f'{self.dir / "game.tsv"} has no key {key}')
+        return default
+
+    def words(self, key, default=None): return self.get(key, default).split()
+    def int(self, key): return int(self.get(key), 0)
+    def table(self, name): return self.dir / name
+
+    @property
+    def title_id(self): return int(self.get('title_id'), 16)
+
+    def builds(self):
+        """{version: {'display': display version, module name: build ID, ...}}"""
+        out = {}
+        for ver, disp, *mods in self.values('build'):
+            out[ver] = dict([('display', disp)] + [tuple(m.split('=', 1)) for m in mods])
+        return out
+
+    def pairs(self, key):   # "a=b c=d" → [(a, b), (c, d)]
+        return [tuple(w.split('=', 1)) for w in self.words(key)]
+
+    def cheats(self):
+        """The profile's cheat files (cheats rows, a path relative to the profile folder each): [Path]. Each is an Atmosphère-format file named as dmnt and the host's
+        engine (dm/host/hle_cheats.c) pick it, the first 16 hex digits of a main build ID in upper case + .txt, and that build must be one of the profile's build rows:
+        the name is the file's build gate (a file of another build never loads). Raises ValueError naming the row otherwise"""
+        mains = {b['main'][:16].upper() for b in self.builds().values() if len(b.get('main', '')) >= 16}
+        out = []
+        for row in self.values('cheats'):
+            rel = row[0] if row else ''
+            p = (self.dir / rel).resolve()
+            if not rel or self.dir not in p.parents: raise ValueError(f'{self.id}: cheats {rel!r}: a file in the profile folder')
+            if not re.fullmatch(r'[0-9A-F]{16}\.txt', p.name): raise ValueError(f'{self.id}: cheats {rel}: the name must be the main build ID\'s first 16 hex digits, upper case, + .txt')
+            if p.stem not in mains: raise ValueError(f'{self.id}: cheats {rel}: build {p.stem} is none of the profile\'s main builds ({", ".join(sorted(mains)) or "none"})')
+            if not p.is_file(): raise ValueError(f'{self.id}: cheats {rel}: no such file')
+            out.append(p)
+        return out
+
+
+def extra_dirs():   # profile folders outside the repository (DM_GAMES_DIR), searched after dm/games
+    return [Path(p) for p in os.environ.get('DM_GAMES_DIR', '').split(':') if p]
+
+
+def search_dirs():   # dm/games, then DM_GAMES_DIR; DM_GAMES_FIRST=1 the other way round
+    return extra_dirs() + [HERE] if os.environ.get('DM_GAMES_FIRST') else [HERE] + extra_dirs()
+
+
+def find_dir(name):   # the profile folder of a title ID (the first of search_dirs that has it); a path is taken as is
+    if os.sep in str(name): return Path(name)
+    return next((d / name for d in search_dirs() if (d / name / 'game.tsv').exists()), HERE / name)
+
+
+def load(name=None):
+    name = name or os.environ.get('DM_GAME')
+    if not name:   # there is no default game
+        have = ', '.join(f'{g.id} ({g.get("name", "")})' for g in all_games())
+        raise SystemExit(f'[RED] DM_GAME is not set: pick a game profile by base game title ID: {have}')
+    d = find_dir(name)
+    if not (d / 'game.tsv').exists():   # profile folders are named after the base game's title ID (the old names smbw / fe_engage are gone)
+        have = ', '.join(f'{g.id} ({g.get("name", "")})' for g in all_games())
+        raise SystemExit(f'[RED] no game profile {d / "game.tsv"} (DM_GAME / GAME take the base game title ID: {have})')
+    return Game(d)
+
+
+def all_games():
+    out, seen = [], set()
+    for root in search_dirs():
+        if not root.is_dir(): continue
+        for d in sorted(root.iterdir()):
+            if (d / 'game.tsv').exists() and d.name not in seen: seen.add(d.name); out.append(Game(d))
+    return out
+
+
+def by_title(tid):
+    return next((g for g in all_games() if g.title_id == tid), None)
+
+
+def by_build(main_id):   # the profile whose build rows register this main build ID (a release of the same build under another title ID: the NSP script's same_build)
+    return next((g for g in all_games() if any(b.get('main') == main_id for b in g.builds().values())), None)
+
+
+def scene_args(g):
+    """The profile's scene_arg rows (the Android launcher's 3D scene choices that the game's engine takes as arguments, DM_GAME_ARGS_ADD; build.gradle sceneOf):
+    <name> <scale or -> <arguments, {s} for the scale> <label> → [(name, scale or None, the arguments with {s} replaced, label)]. ValueError on a malformed row"""
+    out, seen = [], {r[0] for r in g.values('scene_scale') if r} | {r[0] for r in g.values('res_preset') if r}
+    for r in g.values('scene_arg'):
+        usage = f'scene_arg takes <name> <scale or -> <arguments, each starting with -, {{s}} for the scale; no | ; " \\> <label>: {r}'
+        if len(r) < 4 or not re.fullmatch(r'[A-Za-z0-9_-]+', r[0]) or not r[3].strip(): raise ValueError(usage)
+        name, sc, args, label = r[0], r[1], r[2].split(), ' '.join(r[3:]).strip()
+        if name in seen: raise ValueError(f'scene_arg {name}: the name is taken (another scene_arg, a scene_scale or a res_preset)')
+        seen.add(name)
+        if not args or any(not a.startswith('-') or len(a) < 2 for a in args) or any(c in r[2] + label for c in '|;"\\'): raise ValueError(usage)
+        if sc == '-':
+            if '{s}' in r[2]: raise ValueError(f'scene_arg {name}: {{s}} needs a scale: {r}')
+            scale = None
+        else:
+            try: scale = float(sc)
+            except ValueError: raise ValueError(usage)
+            if not 0 < scale <= 4 or '{s}' not in r[2]: raise ValueError(f'scene_arg {name}: a scale (above 0, at most 4) goes into the arguments as {{s}}: {r}')
+        out.append((name, scale, ' '.join(a.replace('{s}', sc) for a in args), label))
+    return out
+
+
+# nn::settings::LanguageCode of the console's 18 languages (hle_oe.c dm_lang_code; the launcher's GameLanguage.CODES)
+LANGUAGE_CODES = ('ja', 'en-US', 'en-GB', 'fr', 'fr-CA', 'de', 'it', 'es', 'es-419', 'nl', 'pt', 'pt-BR', 'ru', 'ko', 'zh-Hans', 'zh-Hant', 'pl', 'th')
+
+
+def header(g):
+    """the host's game_profile.h: the profile constants the host uses, as macros"""
+    q = lambda s: '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    mods = g.words('modules')
+    vers = ', '.join('{' + q(b['main']) + ', ' + q(b['display']) + '}' for b in g.builds().values() if 'main' in b)
+    pi = g.get('present_interval', 'game')   # present interval: game = as the game sets it (as on the Switch), display = one frame per display tick
+    if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
+    ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
+    if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+    fl = g.get('fps_limit', '0')   # Android: the host's frame limiter's default (hle_fpslock.c fps_limit_wait, a wait before each present): 0 = none, else at most that many frames a second; DM_FPS_LIMIT and the launcher's choice override it
+    if not fl.isdigit() or int(fl) and not 10 <= int(fl) <= 60: sys.exit(f'{g.id}: fps_limit must be 0 (none) or 10 to 60 frames a second: {fl}')
+    fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
+    if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
+    try: g.cheats()   # the cheat files' names (their build gate): the host does not compile them in, but a wrong name would never load
+    except ValueError as e: sys.exit(str(e))
+    utp = g.get('ue_texture_pool', '0')   # Unreal's r.Streaming.PoolSize in MB, raised to this on the Mac (hle_uecvar.c; DM_UE_TEXTURE_POOL overrides, and turns it on for iOS): 0 = the game's own pool
+    if not utp.isdigit(): sys.exit(f"{g.id}: ue_texture_pool must be megabytes (0 = the game's own pool): {utp}")
+    ufc = g.get('ue_fps_cvar', 't.MaxFPS')   # the Unreal console variable the host writes fps_target into (hle_fpslock.c; found by name by the rewriter, ue_cvar.py NAMES): a game's own frame limit its settings apply to t.MaxFPS
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]{0,30}', ufc): sys.exit(f'{g.id}: ue_fps_cvar must be a console variable name: {ufc}')
+    ps = g.get('present_snap', 'off')   # present snapshots by default (nvn_mtl.m mtl_snap_on; DM_PRESENT_SNAP and the iOS launcher's Frame buffering override it): on / off
+    if ps not in ('on', 'off'): sys.exit(f'{g.id}: present_snap must be on or off: {ps}')
+    p4 = g.get('pso_mtl4', 'off')   # render pipelines through MTL4Compiler on iOS by default, with the pipeline archive and hybrid pipelines (on by default on the Mac; DM_PSO_MTL4 overrides): on / off
+    if p4 not in ('on', 'off'): sys.exit(f'{g.id}: pso_mtl4 must be on or off: {p4}')
+    pg = g.words('pso_gpu', '')   # GPU architectures the app gets the pipeline archive made offline for (the NSP script's --gpu, build_ipa.sh): when pso_mtl4 is on the app gets these instead of the default g18p, the A19 / A19 Pro of the iPhone 17 family (e.g. 'applegpu_g19p' for a device of the family after it); unset → the default. Whitespace-separated tokens, with or without the applegpu_ prefix
+    if pg and (len(pg) > 4 or any(w == 'none' or not re.fullmatch(r'(applegpu_)?[A-Za-z0-9]+', w) for w in pg)):
+        sys.exit(f"{g.id}: pso_gpu takes 1-4 whitespace-separated GPU architectures such as 'g18p applegpu_g19p' (each an optional applegpu_ prefix then an alphanumeric token; there is no none: omit the key for g18p with pso_mtl4 on, or no archive with pso_mtl4 off): {pg}")
+    et = g.get('enc_thread', 'off')   # Metal encoding on its own thread on the Mac by default (nvn_rec.h rec_on; on iOS it is on for every game; DM_NVN_ENC_THREAD overrides): on / off
+    if et not in ('on', 'off'): sys.exit(f'{g.id}: enc_thread must be on or off: {et}')
+    cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
+    if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt must be on or off: {cp}')
+    aba = g.get('alloc_big_align', 'off')   # nn::mem::StandardAllocator::Allocate aligns blocks of 64 KB or more to 64 KB (hle_os.c; Vanillaware's memory pool storage): on / off
+    if aba not in ('on', 'off'): sys.exit(f'{g.id}: alloc_big_align must be on or off: {aba}')
+    sf = g.get('shared_font', 'bfttf')   # what the shared-font address points at (hle_sdk16.c): bfttf = 8-byte header + TTF, ttf = the TTF alone
+    if sf not in ('bfttf', 'ttf'): sys.exit(f'{g.id}: shared_font must be bfttf or ttf: {sf}')
+    for rc in g.values('romfs_check'):   # a RomFS file line that tells the version's own data from another version's (the Android launcher's RomfsCheck: Prepare and the card): <path> <line | key:name> <expected | main>
+        line_ok = len(rc) == 3 and (rc[1].isdigit() and int(rc[1]) >= 1 or re.fullmatch(r'key:[A-Za-z0-9_]+', rc[1]) is not None)
+        if len(rc) != 3 or not rc[0] or rc[0].startswith('/') or '..' in rc[0].split('/') or not line_ok or not rc[2].strip() or any(c in ''.join(rc) for c in '|;'):
+            sys.exit(f"{g.id}: romfs_check takes <path in the RomFS> <line, from 1, or key:<name> of a MessagePack map> <expected text (no | or ;), or main for the version's main build ID>: {rc}")
+    try: scene_args(g)   # the launcher's 3D scene choices passed as game arguments (build.gradle sceneOf, SceneRes)
+    except ValueError as e: sys.exit(f'{g.id}: {e}')
+    aw = g.get('android_window', '')   # the Android launcher's default Game resolution for this game when the player chose none (Prefs.gameWindow): one of Prefs.WINDOWS
+    if aw and aw not in ('1920x1080', 'original', '1280x720'): sys.exit(f'{g.id}: android_window must be 1920x1080, original or 1280x720: {aw}')
+    pl = g.get('pad_layout', 'simple')   # the virtual gamepad's first layout (DmGamepad.m; afterwards whatever the player switched to in game is kept): simple = 2D, full = 3D (D-pad, right stick, L3 / R3),
+    if pl not in ('simple', 'full', 'touch'): sys.exit(f'{g.id}: pad_layout must be simple, full or touch: {pl}')   # touch = Tap (no control: every touch goes to the game's touch screen)
+    sks = g.get('shader_key_skip', '')   # control-section bytes the shader keys hash as zeros, <offset>+<length> (hle_nvn.c keys_hash, shader_split.py key_ctl; Batman: Arkham Knight: GLSLC's compile information, 0x770+0x78)
+    m = re.fullmatch(r'(0x[0-9a-fA-F]+|\d+)\+(0x[0-9a-fA-F]+|\d+)', sks) if sks else None
+    if sks and (not m or not 0x30 <= int(m[1], 0) or not 0 < int(m[2], 0) or int(m[1], 0) + int(m[2], 0) > 0x880 or (int(m[1], 0) < 0x760 and int(m[1], 0) + int(m[2], 0) > 0x700)):   # not over +0x700..+0x75f, the code area and compute fields the tools read
+        sys.exit(f'{g.id}: shader_key_skip takes <offset>+<length> within the first 0x880 bytes of the control section, past its header (+0x30) and clear of +0x700..+0x75f: {sks}')
+    sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
+    rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
+    if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
+    tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
+    if tfu not in ('on', 'off'): sys.exit(f'{g.id}: tex_flush_upload must be on or off: {tfu}')
+    # A verified CPU staging upload: <main build ID>:<return address offset> of the game's nvnCommandBufferCopyBufferToTexture call whose source block the game reuses
+    # as soon as the call returns; the recording keeps the source bytes (hle_nvn.c copy_keep)
+    tcs = g.get('tex_copy_staging', '')
+    tcm = re.fullmatch(r'([0-9a-f]{32}):(0x[0-9a-f]+)', tcs) if tcs else None
+    if tcs and (not tcm or not 0 < int(tcm[2], 16) <= 0x7ffffffc or int(tcm[2], 16) % 4):
+        sys.exit(f'{g.id}: tex_copy_staging takes a main build ID and an aligned return address offset: {tcs}')
+    tdu = g.get('tex_dirty_upload', 'off')   # with tex_flush_upload: a registered texture the CPU writes after init without any flush is uploaded too (dirty pages, hle_nvn.c nvn_ft_written): on / off
+    if tdu not in ('on', 'off') or (tdu == 'on' and tfu != 'on'): sys.exit(f'{g.id}: tex_dirty_upload must be on or off, and needs tex_flush_upload on: {tdu}')
+    tds = g.get('tex_dyn_slots', 'off')   # shaders whose texture handle the translator could not trace to one slot: slot indices in c2, the bound slots in the fallback arrays (nvn_mtl.m): on / off
+    if tds not in ('on', 'off'): sys.exit(f'{g.id}: tex_dyn_slots must be on or off: {tds}')
+    tsf = g.get('tex_soft', 'off')   # large block-compressed packaged textures kept without their finest level (Android: vka_tex.c "Soft textures", vka_soft.h; from plumber-racer-2's nvn_mtl.m tex_soft): on / off
+    if tsf not in ('on', 'off'): sys.exit(f'{g.id}: tex_soft must be on or off: {tsf}')
+    rss = g.get('ram_saver_soft', 'on')   # Android: Game settings > RAM saver also turns tex_soft on for this game (DM_VK_RAM_SAVER; vka_tex.c soft_on): on / off (off for a game whose textures must stay whole)
+    if rss not in ('on', 'off'): sys.exit(f'{g.id}: ram_saver_soft must be on or off: {rss}')
+    evw = g.get('event_wait', 'on')   # Android: GPU event and sync waits across NVN queues honoured by the Vulkan replay (vka_worker.c qs_on; DM_VK_EVENT_WAIT overrides): on / off
+    if evw not in ('on', 'off'): sys.exit(f'{g.id}: event_wait must be on or off: {evw}')
+    oqs = g.get('occlusion_split_pass', 'off')
+    if oqs not in ('on', 'off'): sys.exit(f'{g.id}: occlusion_split_pass must be on or off: {oqs}')
+    av1 = g.get('av1_decoder', 'hardware')   # Android: AV1 movies on the phone's hardware decoder (MediaCodec, the default) or dav1d frame-parallel (hle_movie_av1.c mav1_send)
+    if av1 not in ('hardware', 'dav1d'): sys.exit(f'{g.id}: av1_decoder must be hardware or dav1d: {av1}')
+    # Android, devices of 12 GB or less (MemTotal up to 12 GiB; vka_lowram.h): defaults the Vulkan replay takes there only, for a profile that sets them. 0 = not set
+    lpp = g.get('low_ram_place_part_mb', '0')   # memory pools of at least this many MiB placed by parts (vka_mem.c part_min; the default elsewhere 1024, DM_VK_PLACE_PART_MB overrides)
+    if not lpp.isdigit() or int(lpp) and not 16 <= int(lpp) <= 65536: sys.exit(f'{g.id}: low_ram_place_part_mb must be 0 (not set) or 16 to 65536 MiB: {lpp}')
+    lic = g.get('low_ram_img_cache_max_mb', '0')   # a ceiling on the texture cache's measured limit, MiB (vka_tex.c img_limit_update; DM_VK_IMG_LIMIT_MB replaces both)
+    if not lic.isdigit() or int(lic) and not 512 <= int(lic) <= 65536: sys.exit(f'{g.id}: low_ram_img_cache_max_mb must be 0 (not set) or 512 to 65536 MiB: {lic}')
+    lap = g.get('low_ram_app_pool_mb', '0')   # the total GetInfo reports, MiB, below the profile's app_pool, which stays the pool (hle_svc.c reported_total; DM_APP_POOL_MB overrides)
+    if not lap.isdigit() or int(lap) and not 1024 <= int(lap) < g.int('app_pool') >> 20:
+        sys.exit(f"{g.id}: low_ram_app_pool_mb must be 0 (not set) or 1024 MiB to below the profile's app_pool ({g.int('app_pool') >> 20} MiB): {lap}")
+    vcr = g.get('vconv_range', 'off')   # vertex attributes converted on the CPU only over the vertices each draw reads (nvn_mtl.m vc_draw_range): on / off
+    if vcr not in ('on', 'off'): sys.exit(f'{g.id}: vconv_range must be on or off: {vcr}')
+    mml = g.get('mem_map_limit', 'on')   # MapPhysicalMemory refused beyond the application pool, as on Horizon (hle_svc.c): on / off
+    if mml not in ('on', 'off'): sys.exit(f'{g.id}: mem_map_limit must be on or off: {mml}')
+    gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report
+    if gts not in ('submission', 'segment'): sys.exit(f'{g.id}: gpu_timestamps must be submission or segment: {gts}')
+    rsub = ' '.join(g.get('romfs_substitute', '').split())   # damaged RomFS files (a .zs that is not a zstd stream) served as another image file (hle_fs.c img_serve; DM_ROMFS_SUBST overrides): <path>=<substitute path> ...
+    if any(w.count('=') != 1 or w.startswith(('=', '/')) or w.endswith('=') or '=/' in w for w in rsub.split()): sys.exit(f'{g.id}: romfs_substitute takes <path>=<substitute path> pairs, RomFS paths without a leading /: {rsub}')
+    dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
+    if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
+    om = g.get('op_mode', 'console')   # the operation mode reported at start (hle_oe.c dm_opmode; DM_OPMODE overrides): console = docked, handheld = touch screen in use (Super Mario Galaxy's pointer)
+    if om not in ('console', 'handheld'): sys.exit(f'{g.id}: op_mode must be console or handheld: {om}')
+    if pl == 'touch' and om != 'handheld': sys.exit(f'{g.id}: pad_layout touch needs op_mode handheld (the touch screen reaches the game only in handheld mode)')
+    langs = g.words('languages', '')   # the console languages the game ships (hle_oe.c dm_lang_limit): the language it is given is one of them, as on a console, where the system gives a game only a language its control data lists. None = no limit
+    bad = [c for c in langs if c not in LANGUAGE_CODES]
+    if bad: sys.exit(f'{g.id}: languages: not a console language code: {" ".join(bad)} (the codes: {" ".join(LANGUAGE_CODES)})')
+    pm = g.get('perf_mode', 'follow')   # the performance mode reported (hle_oe.c): follow = the operation mode's (Boost docked, Normal handheld), boost = Boost always
+    if pm not in ('follow', 'boost'): sys.exit(f'{g.id}: perf_mode must be follow or boost: {pm}')
+    dmo = g.get('depth_mode', 'gl')   # the NVN depth mode the game sets, for the pipeline archive made offline (dm/gfx/tools/pso_offline.py; the host follows the game at run time): gl / zero
+    if dmo not in ('gl', 'zero'): sys.exit(f'{g.id}: depth_mode must be gl or zero: {dmo}')
+    wfn = []   # window size getters, one row per main build: <main build ID> <width fn> <height fn> <the game's own WxH> (loader.c window_apply; DM_WINDOW_SIZE=WxH sets the size, unset = the game's own)
+    if g.get('window_fn', ''):
+        for r in g.values('window_fn'):
+            if len(r) != 4 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in r[1:3]) or not re.fullmatch(r'\d{1,5}x\d{1,5}', r[3]):
+                sys.exit(f"{g.id}: window_fn takes <main build ID (32 hex)> <width function offset> <height function offset> <the game's own WxH>: {r}")
+            w, h = map(int, r[3].split('x'))
+            if not (0 < w < 65536 and 0 < h < 65536): sys.exit(f'{g.id}: window_fn size must be 1..65535 each: {r[3]}')
+            wfn.append('{' + q(r[0]) + f', {r[1]}, {r[2]}, {w}, {h}' + '}')
+    shp = []   # shape tables, one row per main build: <main build ID> <variant> <cam> <squeeze> <shift> <nshift> <fade> <top> <stretch> (word offsets; loader.c shape_apply writes them from DM_VK_PICTURE_ASPECT for the variant)
+    for r in (g.values('shape_table') if g.get('shape_table', '') else []):
+        if len(r) != 9 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not r[1].isalnum() or not all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in r[2:]):
+            sys.exit(f"{g.id}: shape_table takes <main build ID (32 hex)> <variant> and seven word offsets (cam squeeze shift nshift fade top stretch): {r}")
+        shp.append('{' + q(r[0]) + ', ' + q(r[1]) + ', {' + ', '.join(r[2:]) + '}}')
+    # fps_decouple sead: the game's speed follows its measured frame rate through sead's frame-rate controller, which the rewriter gates in main only for a profile with this key (dm/tools/nso_code.py sead_find,
+    # hle_fpslock.c sead_rate; pack_android.py build_rows keys it), and the Android launcher (build.gradle decoupleOf: a frame limit with presentation on the host's tick); a build's own place is an OBS row of its patches.py.
+    # fps_decouple skip: a game that counts frames skips the submit and present of frames behind real time through its own draw flag, at gates its patches.py OBS rows place (the
+    # rewriter takes them only with this key; Mario Tennis Fever, android/mtf_speed.c); the launcher shows Full game speed at low frame rates and keeps the game's own interval
+    dec = g.values('fps_decouple') if g.get('fps_decouple', '') else []
+    for r in dec:
+        if r not in (['sead'], ['skip']): sys.exit(f"{g.id}: fps_decouple takes sead (the rewriter finds the controller; a build's own place is an OBS row of the profile's patches.py) or skip (the game's own draw flag, at OBS rows of its patches.py): {r}")
+    if len(dec) > 1: sys.exit(f"{g.id}: one fps_decouple row (sead or skip): {dec}")
+    # fps_steps: the game's framework runs a whole number of fixed steps each frame and presents at that many vsyncs; the frame rate cap holds 60, 30 or 20 through it (hle_fpslock.c
+    # steps_tick). One row per main build: <main build ID> <global offset> <member offsets to the framework, comma-separated, or -> <mode field> <step count field>: the framework is at
+    # [main + global], then [that + each member]
+    fst = []
+    for r in g.values('fps_steps') if g.get('fps_steps', '') else []:
+        offs = r[2].split(',') if len(r) == 5 and r[2] != '-' else []
+        if len(r) != 5 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in [r[1], r[3], r[4], *offs]) or len(offs) > 3:
+            sys.exit(f"{g.id}: fps_steps takes <main build ID (32 hex)> <global offset> <member offsets, comma-separated (at most 3), or -> <mode field> <step count field>: {r}")
+        fst.append('{' + q(r[0]) + f', {r[1]}, {r[3]}, {r[4]}, {len(offs)}, ' + '{' + (', '.join(offs) or '0') + '}}')
+    # fps_half_draw: the game's engine has a flag that makes it draw and present every second step while it steps 60 times a second; the frame rate cap of 30 sets it
+    # (hle_fpslock.c half_tick). One row per build of the module that holds the flag: <module name> <build ID> <byte offset in the module> <bit mask in that byte>
+    fhd = []
+    for r in g.values('fps_half_draw') if g.get('fps_half_draw', '') else []:
+        if len(r) != 4 or not re.fullmatch(r'[a-z0-9_]+', r[0]) or not re.fullmatch(r'[0-9a-f]{32}', r[1]) or not re.fullmatch(r'0x[0-9a-fA-F]+', r[2]) or not re.fullmatch(r'0x[0-9a-fA-F]{1,2}', r[3]) or bin(int(r[3], 16)).count('1') != 1:
+            sys.exit(f"{g.id}: fps_half_draw takes <module name> <build ID (32 hex)> <byte offset> <bit mask (one bit of the byte)>: {r}")
+        fhd.append('{' + q(r[0]) + ', ' + q(r[1]) + f', {r[2]}, {r[3]}' + '}')
+    drs = []   # the dynamic resolution controller's places, one row per main build: <main build ID> <params probe> <pick> <budget load> <preset flag> (probe.c drs_install)
+    for r in g.values('drs_ctl') if g.get('drs_ctl', '') else []:
+        if len(r) != 5 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in r[1:]):
+            sys.exit(f"{g.id}: drs_ctl takes <main build ID (32 hex)> <parameter object probe> <pick> <budget load> <preset flag> (offsets): {r}")
+        drs.append('{' + q(r[0]) + ', ' + ', '.join(r[1:]) + '}')
+    # Game resolution by the Switch 2 graphics scale (the Android launcher, build.gradle resolutionOf; the host reads DM_GRAPHICS_SCALE and DM_OPMODE, nothing is generated):
+    # <the launcher's choice: WxH or original> <scale 0|1|2> <console|handheld>, for a game that sizes its scenes by the scale rather than its window
+    if g.get('graphics_scale', ''):
+        seen = set()
+        for r in g.values('graphics_scale'):
+            if len(r) != 3 or not re.fullmatch(r'\d{1,5}x\d{1,5}|original', r[0]) or r[1] not in ('0', '1', '2') or r[2] not in ('console', 'handheld') or r[0] in seen:
+                sys.exit(f'{g.id}: graphics_scale takes <WxH | original> <scale 0|1|2> <console | handheld>, one row per choice: {r}')
+            seen.add(r[0])
+        if wfn: sys.exit(f'{g.id}: graphics_scale and window_fn are two levers for one setting: keep one')
+    # Dynamic resolution level lists, one row per main build: <main build ID> <size table offset> <levels> <list offset>:<length>... (loader.c levels_apply): for a game
+    # with no window getter, DM_WINDOW_SIZE=WxH caps the render size by lowering the lists (Game resolution as with window_fn: build.gradle resolutionOf)
+    rlv = []
+    if g.get('res_levels', ''):
+        for r in g.values('res_levels'):
+            if len(r) < 4 or len(r) > 3 + 12 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not re.fullmatch(r'0x[0-9a-fA-F]+', r[1]) or not re.fullmatch(r'\d{1,3}', r[2]) \
+                    or not all(re.fullmatch(r'0x[0-9a-fA-F]+:\d{1,2}', x) for x in r[3:]):
+                sys.exit(f"{g.id}: res_levels takes <main build ID (32 hex)> <size table offset> <levels> <list offset>:<length> (1 to 12 lists): {r}")
+            n = int(r[2])
+            if not 2 <= n <= 255: sys.exit(f'{g.id}: res_levels: the size table must have 2..255 levels: {r[2]}')
+            ls = [(x.split(':')[0], int(x.split(':')[1])) for x in r[3:]]
+            if not all(1 <= ln <= 32 for _, ln in ls): sys.exit(f'{g.id}: res_levels: each list is 1..32 bytes: {r}')
+            ls += [('0', 0)] * (12 - len(ls))
+            rlv.append('{' + q(r[0]) + f', {r[1]}, {n}, {len(r) - 3}, ' + '{' + ', '.join(f'{{{o}, {ln}}}' for o, ln in ls) + '}}')
+        if g.get('graphics_scale', ''): sys.exit(f'{g.id}: graphics_scale and res_levels are two levers for one setting: keep one')
+    # Render configurations the host rewrites (hle_render.c; README.md render_cfg): one row per main build, <main build ID> <slot table offset> <slots> <slot stride> <output field>
+    # <render field> <the game's own OWxOH/RWxRH per slot, comma-separated> original=<WxH> max_render=<WxH> min=<output height>; with one render_quality row,
+    # quality=<boost|normal>:<level> performance=<boost|normal>:<level> (the performance mode and the smallest largest-buffer level of each graphics quality)
+    rcf, rq = [], [0, 0, 0, 0]
+    if g.get('render_cfg', ''):
+        sz = lambda x: re.fullmatch(r'(\d{1,5})x(\d{1,5})', x)
+        for r in g.values('render_cfg'):
+            kv = dict(x.split('=', 1) for x in r[7:] if '=' in x)
+            ok = len(r) == 10 and re.fullmatch(r'[0-9a-f]{32}', r[0]) and all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in (r[1], r[4], r[5])) and r[2].isdigit() and r[3].isdigit() \
+                and sorted(kv) == ['max_render', 'min', 'original'] and sz(kv['original']) and sz(kv['max_render']) and kv['min'] in ('480', '540', '720', '1080', '1440')
+            ents = [re.fullmatch(r'(\d{1,5})x(\d{1,5})/(\d{1,5})x(\d{1,5})', e) for e in r[6].split(',')] if ok else []
+            if not ok or not 1 <= int(r[2]) <= 8 or len(ents) != int(r[2]) or not all(ents) or int(r[3]) < 8 or int(r[3]) % 8 or abs(int(r[4], 0) - int(r[5], 0)) < 8 \
+                    or any(int(v) == 0 for e in ents for v in e.groups()) or any(int(v) == 0 for k in ('original', 'max_render') for v in sz(kv[k]).groups()):
+                sys.exit(f"{g.id}: render_cfg takes <main build ID (32 hex)> <slot table offset> <slots 1-8> <slot stride (a multiple of 8)> <output field> <render field (8 bytes apart at least)>"
+                         f" <OWxOH/RWxRH per slot, comma-separated> original=<WxH> max_render=<WxH> min=<480|540|720|1080|1440>: {r}")
+            ow, oh = map(int, sz(kv['original']).groups()); mw, mh = map(int, sz(kv['max_render']).groups())
+            rows_c = ', '.join('{' + ', '.join(e.groups()) + '}' for e in ents)
+            rcf.append('{' + q(r[0]) + f', {r[1]}, {r[2]}, {r[3]}, {r[4]}, {r[5]}, {{{rows_c}}}, {ow}, {oh}, {mw}, {mh}, {kv["min"]}' + '}')
+        for k in ('graphics_scale', 'window_fn', 'res_levels'):
+            if g.get(k, ''): sys.exit(f'{g.id}: render_cfg and {k} are two levers for one setting: keep one')
+        qr = g.values('render_quality')
+        words = dict(w.split('=', 1) for w in ' '.join(qr[0]).split() if '=' in w) if len(qr) == 1 else {}
+        m = [re.fullmatch(r'(boost|normal):([0-3])', words.get(k, '')) for k in ('quality', 'performance')]
+        if len(qr) != 1 or sorted(words) != ['performance', 'quality'] or len(' '.join(qr[0]).split()) != 2 or not all(m):
+            sys.exit(f'{g.id}: render_cfg needs one render_quality row: quality=<boost|normal>:<level 0-3> performance=<boost|normal>:<level 0-3>: {qr}')
+        rq = [int(m[0][1] == 'boost'), int(m[0][2]), int(m[1][1] == 'boost'), int(m[1][2])]
+    elif g.get('render_quality', ''): sys.exit(f'{g.id}: render_quality needs a render_cfg row')
+    # A render target pool the loader sizes (loader.c rt_pool_apply, dm/host/rt_pool.h; README.md rt_pool): <build ID> <module> <word offset> <the word there, 8 hex: movz w, lsl #16
+    # of the game's own MiB << 4> <the game's own MiB> then 1-4 larger sizes, ascending, each <MiB>=<WxH> (render_cfg's max_render while at least that size is written), and
+    # optionally out_h=<lines> (an output that tall or taller takes at least the first larger size). Needs a render_cfg row of the same main build (the setting that picks the
+    # size, the cap it raises) and a low-RAM key (the device gate: vka_low_ram)
+    rtp = []
+    for r in (g.values('rt_pool') if g.get('rt_pool', '') else []):
+        tiers = [re.fullmatch(r'(\d{1,4})=(\d{1,5})x(\d{1,5})', x) for x in r[5:] if not x.startswith('out_h=')]
+        outh = [x[6:] for x in r[5:] if x.startswith('out_h=')]
+        ok = len(r) >= 6 and re.fullmatch(r'[0-9a-f]{32}', r[0]) and r[1] in mods and re.fullmatch(r'0x[0-9a-fA-F]+', r[2]) and re.fullmatch(r'[0-9a-f]{8}', r[3]) \
+            and r[4].isdigit() and 1 <= len(tiers) <= 4 and all(tiers) and len(outh) <= 1 and all(x.isdigit() and 0 < int(x) <= 4320 for x in outh) \
+            and all(not x.startswith('out_h=') for x in r[5:5 + len(tiers)])
+        if ok:
+            w, base, off = int(r[3], 16), int(r[4]), int(r[2], 0)
+            mbs = [int(t[1]) for t in tiers]; ws = [int(t[2]) for t in tiers]; hs = [int(t[3]) for t in tiers]
+            ok = (w & 0xFFE00000) == 0x52A00000 and (w >> 5) & 0xFFFF == base << 4 and 16 <= base < mbs[0] and all(a < b for a, b in zip(mbs, mbs[1:])) and mbs[-1] <= 4095 \
+                and off % 4 == 0 and all(ws) and all(hs) and all(a <= b and c <= d for a, b, c, d in zip(ws, ws[1:], hs, hs[1:]))
+        if not ok:
+            sys.exit(f"{g.id}: rt_pool takes <build ID (32 hex)> <module> <word offset (a multiple of 4)> <the word there (8 hex): movz w, #<the game's own MiB << 4>, lsl #16>"
+                     f" <the game's own MiB> <MiB>=<max_render WxH> (1 to 4, the MiB ascending up to 4095, the sizes not shrinking) [out_h=<lines>]: {r}")
+        rc = [x for x in g.values('render_cfg') if x and x[0] == r[0]]
+        if r[1] != 'main' or len(rc) != 1:
+            sys.exit(f'{g.id}: rt_pool needs a render_cfg row of the same main build (the setting that picks the size, the max_render it raises): {r}')
+        cm = dict(x.split('=', 1) for x in rc[0][7:] if '=' in x).get('max_render', '0x0').split('x')
+        if ws[0] < int(cm[0]) or hs[0] < int(cm[1]):
+            sys.exit(f"{g.id}: rt_pool max_render must be at least render_cfg's {'x'.join(cm)}: {r}")
+        if not (int(lpp) or int(lic) or int(lap)):
+            sys.exit(f"{g.id}: rt_pool needs a low-RAM key (low_ram_place_part_mb, low_ram_img_cache_max_mb or low_ram_app_pool_mb), the device gate: a device of 12 GB or less gets a larger pool only when the starting setting needs it, a larger device at least the first larger size")
+        if any(x.startswith('{' + q(r[0]) + ', ' + q(r[1]) + ',') for x in rtp): sys.exit(f'{g.id}: rt_pool: one row per build and module: {r}')
+        arr = lambda v: '{' + ', '.join(map(str, v)) + '}'
+        rtp.append('{' + q(r[0]) + f', {q(r[1])}, {r[2]}, 0x{r[3]}u, {base}, {len(mbs)}, {arr(mbs)}, {arr(ws)}, {arr(hs)}, {outh[0] if outh else 0}' + '}')
+    # Depth-only mesh prepass draws of mesh modules Qualcomm's driver draws wrong (vka_draw.c mesh_cut; a workaround, cause open: rendering.md "Depth-only mesh prepass
+    # drawn as spikes on Qualcomm's driver"): one row per pair, <prepass mesh shader key> <colour pass mesh shader key> [<map>], 16 hex digits each. The map says where the
+    # colour mesh module writes what the prepass mesh module writes: <prepass location>:<colour location>,... (locations 0-14; "-": none of them). The prepass is then
+    # drawn with the colour mesh module and its own pixel shader, those inputs moved and the others (0, 0, 0, 1). Without a map it is skipped and EQUAL drawn as LEQUAL
+    mpc = []
+    for r in g.values('mesh_prepass_cut'):
+        if len(r) not in (2, 3) or not all(re.fullmatch(r'[0-9a-f]{16}', x) for x in r[:2]) or r[0] == r[1]:
+            sys.exit(f'{g.id}: mesh_prepass_cut takes <prepass mesh shader key> <colour pass mesh shader key> [<map>], two different keys of 16 lowercase hex digits: {r}')
+        m, has = (1 << 64) - 1, 0
+        if len(r) == 3:
+            has = 1
+            for it in ([] if r[2] == '-' else r[2].split(',')):
+                a = re.fullmatch(r'(\d+):(\d+)', it)
+                if not a or not all(0 <= int(x) <= 14 for x in a.groups()) or (m >> 4 * int(a[1]) & 15) != 15 or any((m >> 4 * k & 15) == int(a[2]) for k in range(15)):
+                    sys.exit(f'{g.id}: mesh_prepass_cut: a map is <prepass location>:<colour location>,... (0-14, each location once on either side) or -: {r}')
+                m = m & ~(15 << 4 * int(a[1])) | int(a[2]) << 4 * int(a[1])
+        mpc.append(f'{{0x{r[0]}ull, 0x{r[1]}ull, 0x{m:016x}ull, {has}}}')
+    if len(mpc) > 64: sys.exit(f'{g.id}: mesh_prepass_cut: at most 64 pairs')
+    vegetation = []
+    for row in g.values('mesh_vegetation_cut'):
+        if len(row) != 2 or not all(re.fullmatch(r'[0-9a-f]{16}', key) for key in row) or row[0] == row[1]:
+            sys.exit(f'{g.id}: mesh_vegetation_cut takes two different mesh shader keys: {row}')
+        vegetation.extend(row)
+    if len(vegetation) > 128 or len(vegetation) != len(set(vegetation)):
+        sys.exit(f'{g.id}: mesh_vegetation_cut: at most 64 pairs, with unique keys')
+    for r in g.values('option'):
+        if len(r) < 3 or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', r[0]) or not r[1].strip() or not r[2].strip():
+            sys.exit(f'{g.id}: option takes <ENV name> <label> <one-line description> [restart|live|settings] [implies=<ENV>] [needs=<marker>]: {r}')
+        for col in r[3:]:
+            for tok in col.split():
+                if tok in ('restart', 'live', 'settings'):
+                    pass
+                elif tok.startswith('implies='):
+                    imp = tok.split('=', 1)[1]
+                    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', imp):
+                        sys.exit(f'{g.id}: option implies takes an environment variable name: {tok}')
+                elif tok.startswith('needs='):
+                    mk = tok.split('=', 1)[1]
+                    if not re.fullmatch(r'[A-Za-z0-9_]+', mk):
+                        sys.exit(f'{g.id}: option needs takes a fixup marker: {tok}')
+                else:
+                    sys.exit(f'{g.id}: option unknown attribute (expected restart|live|settings, implies=<ENV>, needs=<marker>): {tok}')
+    # Shaders whose subgroup operations run as subgroups of one invocation on Qualcomm's own driver even where the device has them (vka_shader.c single_lane, one_lane_forced;
+    # a workaround, Android): one key per row
+    sol = []
+    for r in g.values('subgroup_one_lane'):
+        if len(r) != 1 or not re.fullmatch(r'[0-9a-f]{16}', r[0]): sys.exit(f'{g.id}: subgroup_one_lane takes one shader key of 16 lowercase hex digits: {r}')
+        sol.append(f'0x{r[0]}ull')
+    if len(sol) > 16: sys.exit(f'{g.id}: subgroup_one_lane: at most 16 keys')
+    api = g.get('device_api', '55.15')   # the NVN API major.minor version nvnDeviceGetInteger reports (hle_nvn.c)
+    if not re.fullmatch(r'\d+\.\d+', api): sys.exit(f'{g.id}: device_api must be major.minor: {api}')
+    src = f'dm/games/{g.id}' if g.dir.parent == HERE else str(g.dir)
+    L = [f'// Generated by dm/games/game.py from {src}/game.tsv; do not edit',
+         '#pragma once',
+         f'#define DM_GAME_ID {q(g.id)}',
+         f'#define DM_GAME_NAME {q(g.get("name"))}',
+         f'#define DM_GAME_PROGRAM_ID 0x{int(g.get("program_id"), 16):016X}ull',
+         f'#define DM_GAME_MODULES {{{", ".join(map(q, mods))}}}',
+         f'#define DM_GAME_NMOD {len(mods)}',
+         f'#define DM_GAME_ROMFS_MARKER {q(g.get("romfs_marker"))}',
+         f'#define DM_GAME_MEM_RESERVE {g.int("mem_reserve"):#x}ull',
+         f'#define DM_GAME_MEM_ALIAS {g.int("mem_alias"):#x}ull',
+         f'#define DM_GAME_MEM_STACK {g.int("mem_stack"):#x}ull',
+         f'#define DM_GAME_APP_POOL {g.int("app_pool"):#x}ull',
+         f'#define DM_GAME_MEM_USED {int(g.get("mem_used", "0x4000000"), 0):#x}ull',   # used memory reported beside the heap (hle_svc.c GetInfo UsedMemorySize)
+         f'#define DM_GAME_SYS_RESOURCE {int(g.get("sys_resource", "0x2000000"), 0):#x}ull',   # the NPDM's system resource size (hle_svc.c GetInfo TotalSystemResourceSize; 0 = no virtual address memory)
+         f'#define DM_GAME_ARGS {q(g.get("game_args", ""))}',   # game arguments when the command line gives none (main.c; Octopath Traveler 0: Unreal's -SwitchVirtualAddressSpaceSize=)
+         f'#define DM_GAME_ENV {q(g.get("game_env", ""))}',   # KEY=VALUE pairs getenv answers (hle_os.c; Absolum: .NET's DOTNET_GCRegionRange)
+         f'#define DM_GAME_FASTBOOT_ENV {q(g.get("fastboot_env", ""))}',   # KEY=VALUE host switches DM_FASTBOOT=1 sets for a test run (main.c fastboot_apply; the environment and env.txt win)
+         f'#define DM_GAME_DEVTOOLS {q(g.get("devtools", ""))}',   # the dev tools' build and code offsets for this game (probe.c devrow: DM_TELEPORT, DM_POSE_SET / _GET)
+         f'#define DM_GAME_MEM_MAP_LIMIT {int(mml == "on")}',
+         f'#define DM_GAME_STDALLOC_CAP {int(g.get("stdalloc_cap", "0"), 0):#x}ull',   # StandardAllocator's address space with virtual address memory (hle_svc.c); 0 = what the alias region has room for
+         f'#define DM_GAME_DISPLAY_VERSIONS {vers}',
+         f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
+         f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
+         f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
+         f'#define DM_GAME_FPS_TARGET {int(ft)}',
+         f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',
+         f'#define DM_GAME_FPS_LIMIT {int(fl)}',
+         f'#define DM_GAME_UE_TEXTURE_POOL {int(utp)}',
+         f'#define DM_GAME_UE_FPS_CVAR {q(ufc)}',
+         f'#define DM_GAME_PRESENT_SNAP {int(ps == "on")}',
+         f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
+         f'#define DM_GAME_ENC_THREAD {int(et == "on")}',
+         *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
+         f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',
+         f'#define DM_GAME_OPMODE {int(om == "console")}',
+         f'#define DM_GAME_PERF_BOOST {int(pm == "boost")}',
+         f'#define DM_GAME_LANGUAGES {q(" ".join(langs))}',
+         f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
+         f'#define DM_GAME_TEX_COPY_STAGING_BUILD {q(tcm[1] if tcm else "")}',
+         f'#define DM_GAME_TEX_COPY_STAGING_PC {tcm[2] if tcm else 0}',
+         f'#define DM_GAME_SHADER_KEY_SKIP_OFF {sko:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {skl:#x}',
+         f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
+         f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
+         f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
+         f'#define DM_GAME_TEX_SOFT {int(tsf == "on")}',
+         f'#define DM_GAME_RAM_SAVER_SOFT {int(rss == "on")}',
+         f'#define DM_GAME_OCCLUSION_SPLIT_PASS {int(oqs == "on")}',
+         f'#define DM_GAME_EVENT_WAIT {int(evw == "on")}',
+         f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
+         f'#define DM_GAME_DRAW_BARRIERS_GAME {int(dbr == "game")}',
+         f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
+         f'#define DM_GAME_AV1_DAV1D {int(av1 == "dav1d")}',
+         f'#define DM_GAME_LOW_RAM_PLACE_PART_MB {int(lpp)}', f'#define DM_GAME_LOW_RAM_IMG_CACHE_MAX_MB {int(lic)}', f'#define DM_GAME_LOW_RAM_APP_POOL_MB {int(lap)}',
+         f'#define DM_GAME_ROMFS_SUBST {q(rsub)}',
+         f'#define DM_GAME_WINDOW_FN {{{", ".join(wfn) or "{\"\", 0, 0, 0, 0}"}}}', f'#define DM_GAME_NWINDOW_FN {len(wfn)}',
+         '#define DM_GAME_SHAPE_TABLE {' + (', '.join(shp) or '{"", "", {0}}') + '}', f'#define DM_GAME_NSHAPE_TABLE {len(shp)}',
+         '#define DM_GAME_SUBGROUP_ONE_LANE {' + (', '.join(sol) or '0') + '}', f'#define DM_GAME_NSUBGROUP_ONE_LANE {len(sol)}',
+         '#define DM_GAME_MESH_VEGETATION_CUT {' + (', '.join(f'0x{k}ull' for k in vegetation) or '0') + '}',
+         f'#define DM_GAME_NMESH_VEGETATION_CUT {len(vegetation)}',
+         '#define DM_GAME_MESH_PREPASS_CUT {' + (', '.join(mpc) or '{0, 0, 0, 0}') + '}', f'#define DM_GAME_NMESH_PREPASS_CUT {len(mpc)}',
+
+         '#define DM_GAME_FPS_STEPS {' + (', '.join(fst) or '{"", 0, 0, 0, 0, {0}}') + '}', f'#define DM_GAME_NFPS_STEPS {len(fst)}',
+         '#define DM_GAME_FPS_HALF_DRAW {' + (', '.join(fhd) or '{"", "", 0, 0}') + '}', f'#define DM_GAME_NFPS_HALF_DRAW {len(fhd)}',
+         f'#define DM_GAME_DRS_CTL {{{", ".join(drs) or "{\"\", 0, 0, 0, 0}"}}}', f'#define DM_GAME_NDRS_CTL {len(drs)}',
+         '#define DM_GAME_RENDER_CFG {' + (', '.join(rcf) or '{"", 0, 0, 0, 0, 0, {{0, 0, 0, 0}}, 0, 0, 0, 0, 0}') + '}', f'#define DM_GAME_NRENDER_CFG {len(rcf)}',
+         '#define DM_GAME_RENDER_QUALITY {' + ', '.join(map(str, rq)) + '}', f'#define DM_GAME_RENDER_DEFAULT_OUT {q(aw or "1920x1080")}',
+         '#define DM_GAME_RT_POOL {' + (', '.join(rtp) or '{"", "", 0, 0, 0, 0, {0}, {0}, {0}, 0}') + '}', f'#define DM_GAME_NRT_POOL {len(rtp)}',
+         '#define DM_GAME_RES_LEVELS {' + (', '.join(rlv) or '{"", 0, 0, 0, {{0, 0}}}') + '}', f'#define DM_GAME_NRES_LEVELS {len(rlv)}',
+         *([f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}', f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}'] if g.get('device_api', '') else []),   # without the key: by the SDK version (hle_nvn.c nvn_api)
+         '']
+    return '\n'.join(L)
+
+
+SEED = 'vk_prewarm.bin'   # the profile's prewarm seed list (dm/gfx/vk_android/vka_pwlist.h; made by dm/tools/vk_prewarm.py)
+def seed_header(g):   # vk_prewarm_seed.h: the seed's bytes for vka_pso.c (none: length 0)
+    p = g.dir / SEED
+    b = p.read_bytes() if p.is_file() else b''
+    L = [f'// Generated by dm/games/game.py seed from {g.id}/{SEED} ({len(b)} bytes): the prewarm seed list (dm/gfx/vk_android/vka_pwlist.h). Do not edit', '#include <stddef.h>',
+         f'static const unsigned char dm_vk_prewarm_seed[{max(len(b), 1)}] __attribute__((aligned(8))) = {{']
+    for i in range(0, len(b), 32): L.append(''.join(f'{x},' for x in b[i:i + 32]))
+    if not b: L.append('0')
+    L += ['};', f'static const size_t dm_vk_prewarm_seed_len = {len(b)};', '']
+    return '\n'.join(L)
+
+
+def write_if_changed(out, text):   # written only when it changes: make runs this every time (the profile folder can change under the same GAME), and an unchanged header must not rebuild the host
+    out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
+    if not (out.exists() and out.read_text() == text):
+        tmp = out.with_name(out.name + '.tmp'); tmp.write_text(text); tmp.replace(out)
+
+
+if __name__ == '__main__':
+    a = sys.argv[1:]
+    if a == ['list']:
+        for g in all_games(): print(f'{g.id}\t{g.title_id:016X}\t{g.get("name", "")}')
+    elif len(a) == 3 and a[0] == 'header':
+        write_if_changed(a[2], header(load(a[1])))
+    elif len(a) == 3 and a[0] == 'seed':
+        write_if_changed(a[2], seed_header(load(a[1])))
+    elif len(a) == 2 and a[0] == 'dir':
+        print(load(a[1]).dir)
+    elif len(a) == 3 and a[0] == 'link':   # link → the profile folder (replaced when it points elsewhere)
+        d, ln = load(a[1]).dir, Path(a[2]); ln.parent.mkdir(parents=True, exist_ok=True)
+        if not (ln.is_symlink() and Path(os.readlink(ln)) == d):
+            if ln.is_symlink() or ln.exists(): ln.unlink()
+            ln.symlink_to(d)
+    elif len(a) in (2, 3):
+        print(load(a[0]).get(*a[1:]))
+    else:
+        sys.exit(__doc__ or 'usage: game.py list | game.py <id> <key> [<default>] | game.py header <id> <out.h> | game.py seed <id> <out.h> | game.py dir <id> | game.py link <id> <link>')
