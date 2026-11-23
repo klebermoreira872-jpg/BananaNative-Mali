@@ -22,6 +22,8 @@ jobs:
 
       - name: Build Debug APK
         working-directory: ./android/app
+        env:
+          ORG_GRADLE_PROJECT_PnxPackEngine: fake
         run: ./gradlew assembleDebug -PPnxPackEngine=fake
 
       - name: Upload APK
